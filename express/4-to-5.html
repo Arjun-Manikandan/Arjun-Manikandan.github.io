@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Express 4 to 5 upgrade: observed breakages and fixes (4.22.3 to 5.3.0)</title>
+<meta name="description" content="50 findings from running a real Express app on 4.22.3 and 5.3.0, tested 21 October 2026: verbatim error messages with fixes, silent behaviour changes, and an /admin/* auth bypass. The same findings as JSON: /express/4-to-5.json.">
+<link rel="canonical" href="https://arjun-manikandan.github.io/express/4-to-5">
+<link rel="alternate" type="application/json" href="/express/4-to-5.json" title="Findings as JSON">
+<style>
+body{max-width:52rem;margin:0 auto;padding:0 1rem;font:16px/1.5 system-ui,sans-serif}
+pre{background:#f4f4f4;padding:.5rem;white-space:pre-wrap;overflow-wrap:anywhere}
+table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.25rem .5rem;text-align:left;vertical-align:top}
+dt{font-weight:bold}article{border-top:1px solid #ccc;margin-top:2rem}
+</style>
+</head>
+<body>
+<header>
+<h1>Express 4 to 5 upgrade: what broke, verbatim errors, and fixes</h1>
+<p>Versions tested: express 4.22.3 upgraded to express 5.3.0, on 21 October 2026 (UTC), on Linux with Node v22.22.0 and npm 10.9.4. Method: a real 430-line Express 4 app was run on both versions under a test harness, and every failure was recorded as it happened: boot crashes, thrown errors, compiler errors and 1,915 HTTP responses, each checked to come from the intended Express version and process. These findings are observed, not summarised: none comes from the Express changelog or migration guide, which were deliberately not read, and anything that was not observed is marked untested.</p>
+<p>Summary: moderately painful, and mostly silent. The app won't start until five route strings are rewritten, and about a dozen other changes return wrong results with no error, most of them with no 4.x deprecation warning either. Bringing the app back to identical behaviour took 17 fixes and 60 changed lines; each fix is one line, and finding them is the work. The four most-downloaded companion packages install and run, but the cors README's own examples crash Express 5, and <code>@types/express</code> stays on 4.x, passing code that crashes at boot.</p>
+<p>Machine-readable copy: <a href="/express/4-to-5.json">/express/4-to-5.json</a> holds the same 50 findings in the same order, as a JSON array. Each finding has <code>id</code>, <code>title</code>, <code>severity</code> (<code>silent</code>: wrong behaviour and no error; <code>loud</code>: throws or fails to compile; <code>cosmetic</code>: header-only difference), <code>error_message</code> (verbatim, or <code>null</code>), <code>symptom</code>, <code>cause</code>, <code>fix_before</code>, <code>fix_after</code> and <code>evidence</code> (<code>observed</code> or <code>documented</code>). Each <code>id</code> is also the finding's anchor on this page. For exact string matching use the JSON, because this page's source escapes <code>&lt;</code> and <code>&amp;</code>.</p>
+<p>Report by @Arjun, <time datetime="2026-10-21">21 October 2026</time>.</p>
+</header>
+<main>
+<section id="find-affected-code">
+<h2>Find affected code first</h2>
+<p>Express 5 reports only one bad route pattern per start. In the test app these two commands found all five route strings and all three <code>req.query</code> writes, with no false positives. Route paths built from variables or arrays will not match; check those by hand. Run them from the project root:</p>
+<pre><code class="language-sh"># route strings Express 5 rejects or reads differently
+grep -rnE "\.(get|post|put|patch|delete|del|all|use|options|head|route)\(['\"][^'\"]*[*?()]" --include='*.js' --include='*.ts' --exclude-dir=node_modules .
+
+# writes to req.query
+grep -rnE "req\.query(\.[A-Za-z_\$][A-Za-z0-9_\$]*|\[[^]]*\])?\s*=[^=]" --include='*.js' --include='*.ts' --exclude-dir=node_modules .</code></pre>
+</section>
+<nav id="index" aria-label="Findings index">
+<h2>Findings index</h2>
+<table>
+<thead><tr><th>#</th><th>severity</th><th>finding</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>silent</td><td><a href="#admin-wildcard-guard-bypass">Security: auth guard rewritten as <code>'/admin/*splat'</code> lets <code>GET /admin/</code> through without a token</a></td></tr>
+<tr><td>2</td><td>silent</td><td><a href="#v5-route-syntax-on-express-4">Security: Express 5 route syntax deployed onto Express 4 never matches, so guarded routes are served without a token</a></td></tr>
+<tr><td>3</td><td>silent</td><td><a href="#req-query-reassign-ignored">Security: <code>req.query = clean(req.query)</code> is silently ignored, so query sanitizers stop sanitizing</a></td></tr>
+<tr><td>4</td><td>silent</td><td><a href="#bracket-query-not-parsed">Bracket query strings (<code>?filter[x]=</code>, <code>?ids[]=</code>) are no longer parsed, so filters are silently ignored</a></td></tr>
+<tr><td>5</td><td>silent</td><td><a href="#req-query-writes-lost">Defaults written onto <code>req.query</code> are lost, so pagination breaks and limits stop being enforced</a></td></tr>
+<tr><td>6</td><td>silent</td><td><a href="#listen-error-swallowed"><code>app.listen</code> on a busy port prints "listening" and exits 0 instead of crashing</a></td></tr>
+<tr><td>7</td><td>silent</td><td><a href="#types-express-not-bumped"><code>npm install express@5</code> leaves <code>@types/express</code> on 4.17.25, and <code>tsc</code> passes code that crashes at boot</a></td></tr>
+<tr><td>8</td><td>silent</td><td><a href="#inline-regex-removed-matches-anything">Deleting the inline regex from <code>'/:id(\\d+)'</code> makes <code>/:id</code> match non-numeric ids such as <code>abc</code></a></td></tr>
+<tr><td>9</td><td>silent</td><td><a href="#catch-all-splat-misses-root">A catch-all rewritten as <code>'/*splat'</code> does not match <code>/</code></a></td></tr>
+<tr><td>10</td><td>silent</td><td><a href="#well-known-not-served"><code>express.static</code> stops serving <code>/.well-known/</code>, and the SPA shell or a 404 is returned instead</a></td></tr>
+<tr><td>11</td><td>silent</td><td><a href="#sendfile-dot-folder-404"><code>res.sendFile</code> / <code>res.download</code> with an absolute path through a dot-folder returns 404</a></td></tr>
+<tr><td>12</td><td>silent</td><td><a href="#urlencoded-default-not-extended"><code>express.urlencoded()</code> with no options now produces flat keys such as <code>"user[name]"</code></a></td></tr>
+<tr><td>13</td><td>silent</td><td><a href="#redirect-back-literal"><code>res.redirect('back')</code> sends <code>Location: back</code></a></td></tr>
+<tr><td>14</td><td>silent</td><td><a href="#res-send-number-is-body"><code>res.send(201)</code> responds 200 with the body <code>201</code></a></td></tr>
+<tr><td>15</td><td>silent</td><td><a href="#res-json-status-argument"><code>res.json(201, obj)</code> responds 200 with the body <code>201</code> and drops the object</a></td></tr>
+<tr><td>16</td><td>silent</td><td><a href="#req-host-includes-port"><code>req.host</code> now includes the port</a></td></tr>
+<tr><td>17</td><td>loud</td><td><a href="#wildcard-route-boot-crash">Unnamed wildcard routes (<code>'*'</code>, <code>'/admin/*'</code>, <code>'/files/*'</code>) crash the app at startup</a></td></tr>
+<tr><td>18</td><td>loud</td><td><a href="#cors-readme-options-star">The cors README's <code>app.options('*', cors())</code> crashes Express 5 at startup</a></td></tr>
+<tr><td>19</td><td>loud</td><td><a href="#optional-param-boot-crash">An optional parameter (<code>'/:month?'</code>) crashes the app at startup</a></td></tr>
+<tr><td>20</td><td>loud</td><td><a href="#inline-regex-boot-crash">An inline regex in a route (<code>'/:id(\\d+)'</code>) crashes the app at startup</a></td></tr>
+<tr><td>21</td><td>loud</td><td><a href="#app-del-removed"><code>app.del()</code> throws at startup</a></td></tr>
+<tr><td>22</td><td>loud</td><td><a href="#app-param-function-only"><code>app.param(fn)</code> without a parameter name throws</a></td></tr>
+<tr><td>23</td><td>loud</td><td><a href="#req-body-undefined"><code>req.body</code> is <code>undefined</code> when no body parser matched, so destructuring it throws</a></td></tr>
+<tr><td>24</td><td>loud</td><td><a href="#req-query-reassign-strict-mode">Reassigning <code>req.query</code> throws in strict-mode code (TypeScript output, <code>'use strict'</code>)</a></td></tr>
+<tr><td>25</td><td>loud</td><td><a href="#wildcard-param-is-array">A named wildcard capture is an array: <code>req.params[0]</code> becomes <code>req.params.filepath</code> and <code>res.sendFile</code> throws</a></td></tr>
+<tr><td>26</td><td>loud</td><td><a href="#req-param-removed"><code>req.param('name')</code> throws</a></td></tr>
+<tr><td>27</td><td>loud</td><td><a href="#res-sendfile-lowercase-removed"><code>res.sendfile()</code> (lowercase f) throws</a></td></tr>
+<tr><td>28</td><td>loud</td><td><a href="#res-status-string"><code>res.status('201')</code> with a string throws</a></td></tr>
+<tr><td>29</td><td>loud</td><td><a href="#redirect-url-then-status"><code>res.redirect(url, status)</code> with the old argument order throws</a></td></tr>
+<tr><td>30</td><td>loud</td><td><a href="#app-router-private-removed"><code>app._router</code> is gone, so code that reads <code>app._router.stack</code> throws</a></td></tr>
+<tr><td>31</td><td>loud</td><td><a href="#express-internals-removed"><code>require('express/lib/router/layer')</code> and other Express internals fail with "Cannot find module"</a></td></tr>
+<tr><td>32</td><td>loud</td><td><a href="#app-router-on-express-4"><code>app.router</code> throws on Express 4, so the 5.x replacement for <code>app._router</code> cannot ship before the bump</a></td></tr>
+<tr><td>33</td><td>loud</td><td><a href="#removed-helpers-undefined"><code>express.static.mime</code>, <code>express.query</code> and <code>req.acceptsCharset</code> / <code>acceptsEncoding</code> / <code>acceptsLanguage</code> are removed</a></td></tr>
+<tr><td>34</td><td>loud</td><td><a href="#ts-req-param">TypeScript with <code>@types/express</code> 5.0.6: <code>req.param</code> does not exist</a></td></tr>
+<tr><td>35</td><td>loud</td><td><a href="#ts-res-sendfile">TypeScript with <code>@types/express</code> 5.0.6: <code>res.sendfile</code> does not exist</a></td></tr>
+<tr><td>36</td><td>loud</td><td><a href="#ts-redirect-argument-order">TypeScript with <code>@types/express</code> 5.0.6: <code>res.redirect(url, status)</code> is a type error</a></td></tr>
+<tr><td>37</td><td>loud</td><td><a href="#ts-static-mime">TypeScript with <code>@types/express</code> 5.0.6: <code>express.static.mime</code> does not exist</a></td></tr>
+<tr><td>38</td><td>loud</td><td><a href="#ts-inline-regex-param-name">TypeScript with <code>@types/express</code> 5.0.6: reading <code>req.params.id</code> from <code>'/:id(\\d+)'</code> fails to compile</a></td></tr>
+<tr><td>39</td><td>loud</td><td><a href="#ts-optional-param-name">TypeScript with <code>@types/express</code> 5.0.6: reading <code>req.params.month</code> from <code>'/:month?'</code> fails to compile</a></td></tr>
+<tr><td>40</td><td>loud</td><td><a href="#ts-wildcard-param-zero">TypeScript with <code>@types/express</code> 5.0.6: <code>'/files/*'</code> read as <code>req.params['0']</code> fails to compile</a></td></tr>
+<tr><td>41</td><td>loud</td><td><a href="#ts-old-types-listen-callback">TypeScript with the old <code>@types/express</code> 4.17.25: the 5.x <code>app.listen</code> error callback does not compile</a></td></tr>
+<tr><td>42</td><td>loud</td><td><a href="#ts-old-types-wildcard-name">TypeScript with the old <code>@types/express</code> 4.17.25: a named wildcard parameter does not compile</a></td></tr>
+<tr><td>43</td><td>loud</td><td><a href="#ts-old-types-optional-segment">TypeScript with the old <code>@types/express</code> 4.17.25: an optional segment <code>{/:month}</code> does not compile</a></td></tr>
+<tr><td>44</td><td>cosmetic</td><td><a href="#header-charset-lowercase"><code>charset=UTF-8</code> becomes <code>charset=utf-8</code> on static, <code>sendFile</code> and <code>download</code> responses</a></td></tr>
+<tr><td>45</td><td>cosmetic</td><td><a href="#header-js-mime-type"><code>.js</code> and <code>.mjs</code> are served as <code>text/javascript</code> instead of <code>application/javascript</code></a></td></tr>
+<tr><td>46</td><td>cosmetic</td><td><a href="#header-ico-webmanifest"><code>.ico</code> becomes <code>image/vnd.microsoft.icon</code>, and <code>.webmanifest</code> gains <code>; charset=utf-8</code></a></td></tr>
+<tr><td>47</td><td>cosmetic</td><td><a href="#auto-options-response">Automatic <code>OPTIONS</code> responses change: <code>Allow</code> order and spacing, <code>text/plain</code>, <code>nosniff</code></a></td></tr>
+<tr><td>48</td><td>cosmetic</td><td><a href="#clear-cookie-max-age"><code>res.clearCookie(name, opts)</code> with <code>maxAge</code> in <code>opts</code> now really clears the cookie</a></td></tr>
+<tr><td>49</td><td>cosmetic</td><td><a href="#download-filename-non-ascii"><code>res.download</code> with a non-ASCII filename sends an ASCII fallback plus <code>filename*</code></a></td></tr>
+<tr><td>50</td><td>silent</td><td><a href="#async-handler-errors-caught">Improvement: a throwing <code>async</code> handler now returns 500 instead of killing the process</a></td></tr>
+</tbody>
+</table>
+</nav>
+<section id="findings">
+<h2>Findings, most severe first</h2>
+<p>Order: security issues first, then silent changes (no error, so they ship unnoticed), then loud errors (at startup, per request, then at compile time), then header-only changes. Every finding in this report was observed by running code. In each finding the verbatim <code>error_message</code> comes first, with <code>fix_before</code> and <code>fix_after</code> directly below it.</p>
+<article id="admin-wildcard-guard-bypass">
+<h3>1. Security: auth guard rewritten as <code>'/admin/*splat'</code> lets <code>GET /admin/</code> through without a token</h3>
+<dl>
+<dt>id</dt><dd><code>admin-wildcard-guard-bypass</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">// Express 4 original, which crashes 5.x at boot: app.all('/admin/*', guard);
+app.all('/admin/*splat', guard);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.use('/admin', guard); // preferred: also covers /admin
+// or the exact 4.x meaning:
+app.all('/admin/{*splat}', guard);</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, <code>app.all('/admin/*splat', guard)</code> does not run the guard for <code>GET /admin/</code>: the request returns 200 with the admin page and no token. On 4.22.3 the original <code>app.all('/admin/*', guard)</code> returned 401. Paths with at least one character after <code>/admin/</code>, such as <code>/admin/stats</code>, still match, so only the bare <code>/admin/</code> is exposed. No error and nothing in the log.</dd>
+<dt>cause</dt><dd><code>'/admin/*'</code> crashes 5.x at boot (<a href="#wildcard-route-boot-crash"><code>wildcard-route-boot-crash</code></a>), and <code>'/admin/*splat'</code> is the obvious rewrite. In 5.x a named wildcard without braces needs at least one character, so <code>'/admin/*splat'</code> misses <code>/admin/</code> and <code>'/*splat'</code> misses <code>/</code>. In a 13-URL matrix, 4.x <code>X/*</code> matched exactly what 5.x <code>X/{*name}</code> matches. 4.22.3 printed no deprecation warning for the original pattern.</dd>
+</dl>
+</article>
+<article id="v5-route-syntax-on-express-4">
+<h3>2. Security: Express 5 route syntax deployed onto Express 4 never matches, so guarded routes are served without a token</h3>
+<dl>
+<dt>id</dt><dd><code>v5-route-syntax-on-express-4</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">// Routes rewritten for 5.x, but package-lock.json or the deployed image still has express 4.x
+app.all('/admin/{*splat}', guard);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// Ship the route rewrite and `npm install express@5` in the same commit,
+// and log the running version at boot:
+console.log('express', require('express/package.json').version);
+app.all('/admin/{*splat}', guard);</code></pre></dd>
+<dt>symptom</dt><dd>Code rewritten for 5.x but running on 4.22.3 (an old lockfile, a stale image): <code>'/admin/{*splat}'</code> never matches, so <code>GET /admin/stats</code> is served without a token. No error or warning on 4.22.3. The same code works as written on 5.3.0.</dd>
+<dt>cause</dt><dd>4.22.3 accepts the 5.x pattern string without complaint, and the pattern matches no request. The two route syntaxes do not mix: old patterns crash 5.x, and new ones silently mis-match on 4.x.</dd>
+</dl>
+</article>
+<article id="req-query-reassign-ignored">
+<h3>3. Security: <code>req.query = clean(req.query)</code> is silently ignored, so query sanitizers stop sanitizing</h3>
+<dl>
+<dt>id</dt><dd><code>req-query-reassign-ignored</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.use((req, res, next) => {
+  req.query = clean(req.query);
+  next();
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// Pin one writable copy before anything writes to req.query (also runs on 4.x)
+app.use((req, res, next) => {
+  Object.defineProperty(req, 'query', { value: req.query, writable: true, configurable: true, enumerable: true });
+  next();
+});
+app.use((req, res, next) => {
+  req.query = clean(req.query);
+  next();
+});</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, in plain JavaScript (not strict mode), a sanitizer that reassigns <code>req.query</code> has no effect: <code>$where</code> reaches the handler. On 4.22.3 it was stripped. No error and nothing in the log. In strict-mode code the same line throws instead (<a href="#req-query-reassign-strict-mode"><code>req-query-reassign-strict-mode</code></a>).</dd>
+<dt>cause</dt><dd>In 5.x <code>req.query</code> is a getter with no setter that re-parses the URL on every read (<code>req.query === req.query</code> is <code>false</code>), so the assignment is dropped. 4.22.3 printed no warning. Untested: express-mongo-sanitize and hpp reassign <code>req.query</code>, so they are likely affected.</dd>
+</dl>
+</article>
+<article id="bracket-query-not-parsed">
+<h3>4. Bracket query strings (<code>?filter[x]=</code>, <code>?ids[]=</code>) are no longer parsed, so filters are silently ignored</h3>
+<dl>
+<dt>id</dt><dd><code>bracket-query-not-parsed</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">const app = express();</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">const app = express();
+app.set('query parser', 'extended');</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, <code>?filter[category]=furniture&amp;filter[maxPrice]=100</code> leaves <code>req.query</code> with the literal key <code>"filter[category]"</code>, and the endpoint returned all 4 products instead of <code>["Chair"]</code>. <code>?ids[]=1&amp;ids[]=3</code> returned all 4 products instead of <code>["Pen","Chair"]</code>. Repeated keys (<code>?ids=1&amp;ids=3</code>) still work. No error.</dd>
+<dt>cause</dt><dd>The default query parser in 5.3.0 does not turn brackets into objects or arrays; the 4.22.3 default did. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="req-query-writes-lost">
+<h3>5. Defaults written onto <code>req.query</code> are lost, so pagination breaks and limits stop being enforced</h3>
+<dl>
+<dt>id</dt><dd><code>req-query-writes-lost</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.use('/api/users', (req, res, next) => {
+  req.query.page = parseInt(req.query.page, 10) || 1;
+  req.query.limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+  next();
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// Pin one writable copy first (also runs on 4.x); the middleware above then works unchanged.
+// Or keep your values off req.query.
+app.use((req, res, next) => {
+  Object.defineProperty(req, 'query', { value: req.query, writable: true, configurable: true, enumerable: true });
+  next();
+});</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, with middleware that sets pagination defaults on <code>req.query</code>: <code>GET /api/users</code> returned <code>{"total":3,"users":[]}</code> instead of page 1 with 3 users, <code>?limit=1&amp;page=2</code> returned 2 users instead of 1, and <code>?limit=500</code> was not clamped to 100. No error.</dd>
+<dt>cause</dt><dd>In 5.x every read of <code>req.query</code> re-parses the URL (<code>req.query === req.query</code> is <code>false</code>), so values written onto it are gone by the next read. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="listen-error-swallowed">
+<h3>6. <code>app.listen</code> on a busy port prints "listening" and exits 0 instead of crashing</h3>
+<dl>
+<dt>id</dt><dd><code>listen-error-swallowed</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.listen(PORT, () => console.log(`Acme listening on http://localhost:${PORT}`));</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.listen(PORT, (err) => {
+  if (err) throw err;
+  console.log(`Acme listening on http://localhost:${PORT}`);
+});</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, with the port already taken, the app printed <code>Acme listening on http://localhost:4300</code> and exited with code 0. With another open handle (a DB pool, a timer) it keeps running and serves nothing, while the old process keeps answering. On 4.22.3 it crashed with <code>Error: listen EADDRINUSE: address already in use 0.0.0.0:4300</code> and exit code 1.</dd>
+<dt>cause</dt><dd>In 5.x the <code>app.listen</code> callback runs even when listening failed, with the error as its first argument; a callback that ignores its argument hides the failure. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="types-express-not-bumped">
+<h3>7. <code>npm install express@5</code> leaves <code>@types/express</code> on 4.17.25, and <code>tsc</code> passes code that crashes at boot</h3>
+<dl>
+<dt>id</dt><dd><code>types-express-not-bumped</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-sh">npm install express@5</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-sh">npm install express@5
+npm install -D @types/express@5
+# then test at runtime anyway: a clean tsc is not proof</code></pre></dd>
+<dt>symptom</dt><dd>After <code>npm install express@5</code>, <code>@types/express</code> stays at 4.17.25 with no message, and <code>tsc</code> reports 0 errors on code that then fails on 5.3.0: the <code>PathError</code> boot crash, <code>app._router</code> reads, and <code>req.query = …</code> in compiled (strict) code. Even <code>@types/express</code> 5.0.6 catches only 7 problems and misses 10: <code>app.get('*')</code> and <code>app.all('/admin/*')</code> (boot crash), writing to or reassigning <code>req.query</code>, <code>app._router.stack</code>, <code>res.send(201)</code>, <code>res.redirect('back')</code>, <code>req.host</code>, an undefined <code>req.body</code>, and the <code>app.listen</code> error.</dd>
+<dt>cause</dt><dd><code>@types/express</code> publishes a separate 5.x line (5.0.6, published 2025-12-01) and has no peer link to <code>express</code>, so npm neither bumps it nor flags the mismatch.</dd>
+</dl>
+</article>
+<article id="inline-regex-removed-matches-anything">
+<h3>8. Deleting the inline regex from <code>'/:id(\\d+)'</code> makes <code>/:id</code> match non-numeric ids such as <code>abc</code></h3>
+<dl>
+<dt>id</dt><dd><code>inline-regex-removed-matches-anything</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">// was '/:id(\\d+)', which crashes 5.x at boot
+router.get('/:id', getUser);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">router.param('id', (req, res, next, id) => {
+  if (!/^\d+$/.test(id)) return next('route');
+  // …load the user as before
+  next();
+});
+router.get('/:id', getUser);</code></pre></dd>
+<dt>symptom</dt><dd>After removing <code>(\\d+)</code> to stop the boot crash, 5.3.0 sends <code>/api/users/abc</code> into the id route: <code>router.param</code> runs and answers <code>{"error":"user abc not found"}</code>. On 4.22.3 the request fell through to the API 404. No error.</dd>
+<dt>cause</dt><dd>5.x route strings take no inline regex, so the constraint has to move into code; a bare <code>/:id</code> accepts any segment. 4.22.3 printed no warning for the inline regex.</dd>
+</dl>
+</article>
+<article id="catch-all-splat-misses-root">
+<h3>9. A catch-all rewritten as <code>'/*splat'</code> does not match <code>/</code></h3>
+<dl>
+<dt>id</dt><dd><code>catch-all-splat-misses-root</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">// rewrite of app.get('*', handler)
+app.get('/*splat', handler);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.get('/{*splat}', handler);</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, <code>app.get('/*splat', handler)</code> does not match <code>GET /</code>, and <code>'/admin/*splat'</code> does not match <code>/admin/</code>. No error.</dd>
+<dt>cause</dt><dd>In 5.x a named wildcard without braces needs at least one character; braces make it optional. In a 13-URL matrix, 4.x <code>X/*</code> matched exactly what 5.x <code>X/{*name}</code> matches, so <code>'*'</code> becomes <code>'/{*splat}'</code>.</dd>
+</dl>
+</article>
+<article id="well-known-not-served">
+<h3>10. <code>express.static</code> stops serving <code>/.well-known/</code>, and the SPA shell or a 404 is returned instead</h3>
+<dl>
+<dt>id</dt><dd><code>well-known-not-served</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.use(express.static(path.join(__dirname, 'public')));</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.use('/.well-known', express.static(path.join(__dirname, 'public', '.well-known')));
+app.use(express.static(path.join(__dirname, 'public')));
+// Not dotfiles: 'allow' on public/: that would also serve .env</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, <code>GET /.well-known/security.txt</code> returned 200 <code>text/html</code>: the SPA shell from the catch-all route (a 404 without one). On 4.22.3 it returned the file as <code>text/plain</code>. No error. Untested inference: ACME (Let's Encrypt) HTTP-01 challenges under <code>/.well-known/</code> would fail the same way.</dd>
+<dt>cause</dt><dd>5.3.0's <code>express.static</code> (serve-static 2.2.1) does not serve files inside a folder whose name starts with a dot; 4.22.3's (serve-static 1.16.3) served this one. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="sendfile-dot-folder-404">
+<h3>11. <code>res.sendFile</code> / <code>res.download</code> with an absolute path through a dot-folder returns 404</h3>
+<dl>
+<dt>id</dt><dd><code>sendfile-dot-folder-404</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.sendFile(path.join(__dirname, 'public', 'index.html'));</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.sendFile('index.html', { root: path.join(__dirname, 'public') });
+// res.download takes the same { root } option</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, with the app deployed under a folder whose name starts with a dot (e.g. <code>~/.deploy/acme</code>), <code>res.sendFile(abs)</code> and <code>res.download(abs)</code> return 404 <code>{"error":"Not Found"}</code> and nothing is logged. Moved there, the fully fixed app fell from 101/101 to 98/101 passing checks. On 4.22.3: 200. The failure depends on the deploy path, not on the code. Untested: whether pnpm's <code>node_modules/.pnpm</code> store path triggers it too.</dd>
+<dt>cause</dt><dd>5.x refuses the file when any folder in its absolute path starts with a dot; passing <code>{ root }</code> avoids it. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="urlencoded-default-not-extended">
+<h3>12. <code>express.urlencoded()</code> with no options now produces flat keys such as <code>"user[name]"</code></h3>
+<dl>
+<dt>id</dt><dd><code>urlencoded-default-not-extended</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.use(express.urlencoded());</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.use(express.urlencoded({ extended: true }));</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, posting <code>user[name]=Ada&amp;interests[]=math</code> gives <code>{"user[name]":"Ada",…,"interests[]":["math",…]}</code>. On 4.22.3 it gave <code>{"user":{"name":"Ada",…},"interests":["math",…]}</code>. No error.</dd>
+<dt>cause</dt><dd>With no options, 5.x parses the body flat; <code>{ extended: true }</code> restores nested objects and arrays. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="redirect-back-literal">
+<h3>13. <code>res.redirect('back')</code> sends <code>Location: back</code></h3>
+<dl>
+<dt>id</dt><dd><code>redirect-back-literal</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.redirect('back');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.redirect(req.get('Referrer') || '/');</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 the response carries <code>Location: back</code>. On 4.22.3 it carried <code>Location: http://localhost/settings</code> (the Referer), or <code>/</code> without one. No error.</dd>
+<dt>cause</dt><dd>5.x no longer treats <code>'back'</code> as a special value. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="res-send-number-is-body">
+<h3>14. <code>res.send(201)</code> responds 200 with the body <code>201</code></h3>
+<dl>
+<dt>id</dt><dd><code>res-send-number-is-body</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.send(201);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.sendStatus(201);</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0: status 200, body <code>201</code>, <code>application/json</code>. On 4.22.3: status 201, body <code>Created</code>. No error.</dd>
+<dt>cause</dt><dd>5.x sends a number passed to <code>res.send</code> as the body, not as the status. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="res-json-status-argument">
+<h3>15. <code>res.json(201, obj)</code> responds 200 with the body <code>201</code> and drops the object</h3>
+<dl>
+<dt>id</dt><dd><code>res-json-status-argument</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.json(201, { ok: true });</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.status(201).json({ ok: true });</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0: status 200, body <code>201</code>; the object is dropped. On 4.22.3: status 201, body <code>{"ok":true}</code>. No error.</dd>
+<dt>cause</dt><dd>5.x <code>res.json</code> takes only the body, so the status code is sent as the body. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="req-host-includes-port">
+<h3>16. <code>req.host</code> now includes the port</h3>
+<dl>
+<dt>id</dt><dd><code>req-host-includes-port</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">const host = req.host;</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">const host = req.hostname;</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 <code>req.host</code> was <code>localhost:4100</code>; on 4.22.3 it was <code>localhost</code>. No error.</dd>
+<dt>cause</dt><dd><code>req.host</code> changed meaning in 5.x; <code>req.hostname</code> gives the name without the port. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="wildcard-route-boot-crash">
+<h3>17. Unnamed wildcard routes (<code>'*'</code>, <code>'/admin/*'</code>, <code>'/files/*'</code>) crash the app at startup</h3>
+<dl>
+<dt>id</dt><dd><code>wildcard-route-boot-crash</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>PathError [TypeError]: Missing parameter name at index 1: *; visit https://git.new/pathToRegexpError for info</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.get('*', handler);
+app.all('/admin/*', guard);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.get('/{*splat}', handler); // X/* becomes X/{*name}: the same matches as 4.x
+app.use('/admin', guard);      // preferred for guards; or app.all('/admin/{*splat}', guard)
+// Not '/admin/*splat': it skips /admin/ (see admin-wildcard-guard-bypass)</code></pre></dd>
+<dt>symptom</dt><dd>5.3.0 exits with code 1 before listening. The index depends on the pattern: <code>'/files/*'</code> gives <code>at index 8</code>. Boot errors arrive one per start, in <code>require()</code> order (five bad patterns took five restarts), and for <code>app.get</code> / <code>app.all</code> the 10-frame stack trace holds no line of your code: search your code for the error's <code>originalPath</code>.</dd>
+<dt>cause</dt><dd>Route strings are compiled by path-to-regexp 8.4.2, inside the new <code>router</code> 2.2.0 (4.22.3 used 0.1.13), and a wildcard needs a name. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="cors-readme-options-star">
+<h3>18. The cors README's <code>app.options('*', cors())</code> crashes Express 5 at startup</h3>
+<dl>
+<dt>id</dt><dd><code>cors-readme-options-star</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: Missing parameter name at index 1: *; visit https://git.new/pathToRegexpError for info</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.options('*', cors());</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.use(cors()); // handles pre-flight on 4.x and 5.x
+// app.options('/{*splat}', cors()) works on 5.x only: on 4.x it answers 200 with no CORS headers</code></pre></dd>
+<dt>symptom</dt><dd>cors 2.8.6 installs on 5.3.0 without warnings, and <code>app.use(cors())</code>, pre-flight, per-route use and an origin allow-list all behave as on 4.x. The pre-flight example in its README crashes at startup.</dd>
+<dt>cause</dt><dd>The same wildcard rule as <a href="#wildcard-route-boot-crash"><code>wildcard-route-boot-crash</code></a>. cors declares no <code>peerDependencies</code> (engines <code>node >= 0.10</code>, last publish 2026-01-22), so nothing warns.</dd>
+</dl>
+</article>
+<article id="optional-param-boot-crash">
+<h3>19. An optional parameter (<code>'/:month?'</code>) crashes the app at startup</h3>
+<dl>
+<dt>id</dt><dd><code>optional-param-boot-crash</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>PathError [TypeError]: Unexpected ? at index 21: /archive/:year/:month?; visit https://git.new/pathToRegexpError for info</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.get('/archive/:year/:month?', handler);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.get('/archive/:year{/:month}', handler); // behaved identically</code></pre></dd>
+<dt>symptom</dt><dd>5.3.0 exits before listening. Only one bad pattern is reported per start.</dd>
+<dt>cause</dt><dd>5.x route strings have no <code>?</code> modifier; an optional segment goes in braces. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="inline-regex-boot-crash">
+<h3>20. An inline regex in a route (<code>'/:id(\\d+)'</code>) crashes the app at startup</h3>
+<dl>
+<dt>id</dt><dd><code>inline-regex-boot-crash</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>PathError [TypeError]: Unexpected ( at index 4: /:id(\d+); visit https://git.new/pathToRegexpError for info</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">router.get('/:id(\\d+)', getUser);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">router.param('id', (req, res, next, id) => {
+  if (!/^\d+$/.test(id)) return next('route');
+  // …load the user as before
+  next();
+});
+router.get('/:id', getUser);</code></pre></dd>
+<dt>symptom</dt><dd>5.3.0 exits before listening. Deleting only the regex lets the app start but makes <code>/:id</code> match <code>abc</code> (<a href="#inline-regex-removed-matches-anything"><code>inline-regex-removed-matches-anything</code></a>).</dd>
+<dt>cause</dt><dd>5.x route strings take no inline regular expressions. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="app-del-removed">
+<h3>21. <code>app.del()</code> throws at startup</h3>
+<dl>
+<dt>id</dt><dd><code>app-del-removed</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: app.del is not a function</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.del('/products/:id', handler);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.delete('/products/:id', handler);</code></pre></dd>
+<dt>symptom</dt><dd>Thrown at startup on 5.3.0. The cors README still uses <code>app.del('/products/:id', cors(), …)</code>.</dd>
+<dt>cause</dt><dd><code>app.del</code> was removed in 5.x; <code>app.delete</code> remains. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="app-param-function-only">
+<h3>22. <code>app.param(fn)</code> without a parameter name throws</h3>
+<dl>
+<dt>id</dt><dd><code>app-param-function-only</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: argument name must be a string</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.param(fn);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.param('name', fn);</code></pre></dd>
+<dt>symptom</dt><dd>Thrown at startup on 5.3.0 (observed in a standalone probe).</dd>
+<dt>cause</dt><dd>The function-only form of <code>app.param</code> was removed; a parameter name is required. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="req-body-undefined">
+<h3>23. <code>req.body</code> is <code>undefined</code> when no body parser matched, so destructuring it throws</h3>
+<dl>
+<dt>id</dt><dd><code>req-body-undefined</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: Cannot destructure property 'name' of 'req.body' as it is undefined.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.use(express.json());
+app.post('/api/users', (req, res) => {
+  const { name } = req.body;
+  // …
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.use(express.json());
+// after the parsers:
+app.use((req, res, next) => { if (req.body === undefined) req.body = {}; next(); });</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, a request with no body, or with a content type no parser handles (e.g. <code>text/plain</code>), leaves <code>req.body</code> <code>undefined</code>; the handler throws, and what was a 400 on 4.22.3 becomes a 500.</dd>
+<dt>cause</dt><dd>5.x leaves <code>req.body</code> <code>undefined</code> when no parser matched the request. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="req-query-reassign-strict-mode">
+<h3>24. Reassigning <code>req.query</code> throws in strict-mode code (TypeScript output, <code>'use strict'</code>)</h3>
+<dl>
+<dt>id</dt><dd><code>req-query-reassign-strict-mode</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: Cannot set property query of #&lt;IncomingMessage> which has only a getter</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">req.query = clean(req.query);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// Pin one writable copy first (also runs on 4.x)
+app.use((req, res, next) => {
+  Object.defineProperty(req, 'query', { value: req.query, writable: true, configurable: true, enumerable: true });
+  next();
+});
+// …then the assignment works:
+req.query = clean(req.query);</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, <code>req.query = …</code> in strict-mode code throws and the request returns 500. TypeScript emits <code>"use strict"</code>, so compiled TypeScript hits this, and <code>tsc</code> does not catch it. In plain JavaScript the same line is silently ignored (<a href="#req-query-reassign-ignored"><code>req-query-reassign-ignored</code></a>).</dd>
+<dt>cause</dt><dd>In 5.x <code>req.query</code> is a getter with no setter. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="wildcard-param-is-array">
+<h3>25. A named wildcard capture is an array: <code>req.params[0]</code> becomes <code>req.params.filepath</code> and <code>res.sendFile</code> throws</h3>
+<dl>
+<dt>id</dt><dd><code>wildcard-param-is-array</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: path must be a string to res.sendFile</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.get('/files/*', (req, res) => res.sendFile(req.params[0], { root }));</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.get('/files/*filepath', (req, res) => res.sendFile(req.params.filepath.join('/'), { root }));</code></pre></dd>
+<dt>symptom</dt><dd>After rewriting <code>'/files/*'</code> for 5.3.0, <code>req.params[0]</code> no longer exists and the named capture is an array of path segments, e.g. <code>["reports","2024","q3.txt"]</code>; passing it to <code>res.sendFile</code> throws.</dd>
+<dt>cause</dt><dd>In 5.x a wildcard captures an array of segments, not a string. 4.22.3 printed no warning.</dd>
+</dl>
+</article>
+<article id="req-param-removed">
+<h3>26. <code>req.param('name')</code> throws</h3>
+<dl>
+<dt>id</dt><dd><code>req-param-removed</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: req.param is not a function</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">const name = req.param('name');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">const name = req.params.name; // or req.query.name / req.body.name, wherever the value comes from</code></pre></dd>
+<dt>symptom</dt><dd>Thrown when the handler runs on 5.3.0.</dd>
+<dt>cause</dt><dd><code>req.param()</code> was removed in 5.x. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="res-sendfile-lowercase-removed">
+<h3>27. <code>res.sendfile()</code> (lowercase f) throws</h3>
+<dl>
+<dt>id</dt><dd><code>res-sendfile-lowercase-removed</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: res.sendfile is not a function</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.sendfile(file);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.sendFile(file); // for an absolute path, prefer { root } (see sendfile-dot-folder-404)</code></pre></dd>
+<dt>symptom</dt><dd>Thrown when the handler runs on 5.3.0.</dd>
+<dt>cause</dt><dd>The lowercase alias was removed in 5.x. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="res-status-string">
+<h3>28. <code>res.status('201')</code> with a string throws</h3>
+<dl>
+<dt>id</dt><dd><code>res-status-string</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>TypeError: Invalid status code: "201". Status code must be an integer.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.status('201');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.status(201);</code></pre></dd>
+<dt>symptom</dt><dd>Thrown when the handler runs on 5.3.0.</dd>
+<dt>cause</dt><dd>5.x <code>res.status</code> accepts only an integer. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="redirect-url-then-status">
+<h3>29. <code>res.redirect(url, status)</code> with the old argument order throws</h3>
+<dl>
+<dt>id</dt><dd><code>redirect-url-then-status</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>express deprecated Url must be a string
+express deprecated Status must be a number
+TypeError: Invalid status code: "/pricing". Status code must be an integer.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.redirect('/pricing', 301);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.redirect(301, '/pricing');</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 the two deprecation lines are printed, then the call throws; the 500 response still carries <code>Location: 301</code>.</dd>
+<dt>cause</dt><dd>With two arguments, 5.x reads the first as the status and the second as the URL. 4.22.3 printed a deprecation warning when this line ran.</dd>
+</dl>
+</article>
+<article id="app-router-private-removed">
+<h3>30. <code>app._router</code> is gone, so code that reads <code>app._router.stack</code> throws</h3>
+<dl>
+<dt>id</dt><dd><code>app-router-private-removed</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Cannot read properties of undefined (reading 'stack')</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app._router.stack.forEach(printRoute);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.router.stack.forEach(printRoute); // 5.x only: change it in the same commit as the express@5 bump</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, code that walks <code>app._router.stack</code> (route listers, test helpers) throws (observed in a standalone probe). After one <code>app.get()</code> the 5.x stack holds 1 layer, not 3: the built-in <code>query</code> and <code>expressInit</code> layers are gone. Untested: express-list-endpoints reads <code>app._router</code>.</dd>
+<dt>cause</dt><dd>Routing moved to the separate <code>router</code> package (2.2.0), and <code>app.router</code> replaces <code>app._router</code>. On 4.x <code>app.router</code> threw (<a href="#app-router-on-express-4"><code>app-router-on-express-4</code></a>), so no single property works on both versions.</dd>
+</dl>
+</article>
+<article id="express-internals-removed">
+<h3>31. <code>require('express/lib/router/layer')</code> and other Express internals fail with "Cannot find module"</h3>
+<dl>
+<dt>id</dt><dd><code>express-internals-removed</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Error: Cannot find module 'express/lib/router/layer'</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">const Layer = require('express/lib/router/layer');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// No drop-in replacement was tested. Remove the dependency on express/lib/*:
+// routing now lives in the separate 'router' package (2.2.0).</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0, <code>express/lib/router</code>, <code>express/lib/router/layer</code>, <code>express/lib/router/route</code> and <code>express/lib/middleware/init</code> no longer exist (observed in a standalone probe). Untested: express-async-errors patches <code>express/lib/router/layer</code>, and @opentelemetry/instrumentation-express patches router internals, so both are likely to break.</dd>
+<dt>cause</dt><dd>Routing now lives in the separate <code>router</code> package (2.2.0).</dd>
+</dl>
+</article>
+<article id="app-router-on-express-4">
+<h3>32. <code>app.router</code> throws on Express 4, so the 5.x replacement for <code>app._router</code> cannot ship before the bump</h3>
+<dl>
+<dt>id</dt><dd><code>app-router-on-express-4</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>'app.router' is deprecated!</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">// still on express 4.22.3
+app.router.stack.forEach(printRoute);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// keep app._router while on 4.x; switch to app.router in the express@5 bump commit
+app._router.stack.forEach(printRoute);</code></pre></dd>
+<dt>symptom</dt><dd>4.22.3 throws when code reads <code>app.router</code>, the 5.x replacement for <code>app._router</code>.</dd>
+<dt>cause</dt><dd><code>app.router</code> exists only in 5.x; reading it on 4.x throws. No single property works on both versions.</dd>
+</dl>
+</article>
+<article id="removed-helpers-undefined">
+<h3>33. <code>express.static.mime</code>, <code>express.query</code> and <code>req.acceptsCharset</code> / <code>acceptsEncoding</code> / <code>acceptsLanguage</code> are removed</h3>
+<dl>
+<dt>id</dt><dd><code>removed-helpers-undefined</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">express.static.mime.lookup(file);
+req.acceptsCharset('utf-8');
+req.acceptsEncoding('gzip');
+req.acceptsLanguage('en');
+app.use(express.query());</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">require('mime-types').lookup(file); // npm install mime-types
+req.acceptsCharsets('utf-8');
+req.acceptsEncodings('gzip');
+req.acceptsLanguages('en');
+// express.query(): removed; no replacement was tested</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 these are <code>undefined</code>, so nothing fails until code calls them (observed in a standalone probe).</dd>
+<dt>cause</dt><dd>Removed in 5.x. <code>mime</code> (1.6.0) was replaced by <code>mime-types</code> (3.0.2).</dd>
+</dl>
+</article>
+<article id="ts-req-param">
+<h3>34. TypeScript with <code>@types/express</code> 5.0.6: <code>req.param</code> does not exist</h3>
+<dl>
+<dt>id</dt><dd><code>ts-req-param</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>error TS2551: Property 'param' does not exist on type 'Request&lt;{ name: string; }, any, any, ParsedQs, Record&lt;string, any>>'. Did you mean 'params'?</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">const name = req.param('name');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">const name = req.params.name;</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> 7.0.2 in strict mode rejects <code>req.param('name')</code> once <code>@types/express</code> is 5.0.6.</dd>
+<dt>cause</dt><dd><code>req.param()</code> was removed in 5.x (<a href="#req-param-removed"><code>req-param-removed</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-res-sendfile">
+<h3>35. TypeScript with <code>@types/express</code> 5.0.6: <code>res.sendfile</code> does not exist</h3>
+<dl>
+<dt>id</dt><dd><code>ts-res-sendfile</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>error TS2551: Property 'sendfile' does not exist on type 'Response&lt;any, Record&lt;string, any>, number>'. Did you mean 'sendFile'?</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.sendfile(file);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.sendFile(file);</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> 7.0.2 in strict mode rejects <code>res.sendfile(…)</code> once <code>@types/express</code> is 5.0.6.</dd>
+<dt>cause</dt><dd>The lowercase alias was removed in 5.x (<a href="#res-sendfile-lowercase-removed"><code>res-sendfile-lowercase-removed</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-redirect-argument-order">
+<h3>36. TypeScript with <code>@types/express</code> 5.0.6: <code>res.redirect(url, status)</code> is a type error</h3>
+<dl>
+<dt>id</dt><dd><code>ts-redirect-argument-order</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">res.redirect('/pricing', 301);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">res.redirect(301, '/pricing');</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> 7.0.2 in strict mode flags <code>res.redirect('/pricing', 301)</code>. TS2345 is a generic message; it means this problem when the flagged call is <code>res.redirect</code> with the URL first.</dd>
+<dt>cause</dt><dd>5.x takes the status first (<a href="#redirect-url-then-status"><code>redirect-url-then-status</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-static-mime">
+<h3>37. TypeScript with <code>@types/express</code> 5.0.6: <code>express.static.mime</code> does not exist</h3>
+<dl>
+<dt>id</dt><dd><code>ts-static-mime</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>error TS2339: Property 'mime' does not exist on type 'RequestHandlerConstructor&lt;Response&lt;any, Record&lt;string, any>>>'.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">express.static.mime.lookup(file);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// use the mime-types package instead (npm install mime-types)
+mimeTypes.lookup(file);</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> 7.0.2 in strict mode rejects <code>express.static.mime</code> once <code>@types/express</code> is 5.0.6.</dd>
+<dt>cause</dt><dd><code>express.static.mime</code> was removed in 5.x (<a href="#removed-helpers-undefined"><code>removed-helpers-undefined</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-inline-regex-param-name">
+<h3>38. TypeScript with <code>@types/express</code> 5.0.6: reading <code>req.params.id</code> from <code>'/:id(\\d+)'</code> fails to compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-inline-regex-param-name</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Property 'id' does not exist on type '{ "id(\\d+)": string; }'</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">router.get('/:id(\\d+)', (req, res) => {
+  const { id } = req.params;
+  // …
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">router.param('id', (req, res, next, id) => {
+  if (!/^\d+$/.test(id)) return next('route');
+  next();
+});
+router.get('/:id', (req, res) => {
+  const { id } = req.params;
+  // …
+});</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> catches the inline regex only because the handler reads the old parameter name: the 5.x types read the whole <code>id(\d+)</code> as the name. A handler that never reads it compiles, then crashes at boot (<a href="#inline-regex-boot-crash"><code>inline-regex-boot-crash</code></a>).</dd>
+<dt>cause</dt><dd>5.x route strings take no inline regex.</dd>
+</dl>
+</article>
+<article id="ts-optional-param-name">
+<h3>39. TypeScript with <code>@types/express</code> 5.0.6: reading <code>req.params.month</code> from <code>'/:month?'</code> fails to compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-optional-param-name</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Property 'month' does not exist on type '{ year: string; } &amp; { "month?": string; }'. Did you mean 'month?'?</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.get('/archive/:year/:month?', (req, res) => {
+  const { year, month } = req.params;
+  // …
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.get('/archive/:year{/:month}', (req, res) => {
+  const { year, month } = req.params;
+  // …
+});</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> catches the old optional syntax only because the handler reads the parameter: the 5.x types read <code>month?</code> as the name.</dd>
+<dt>cause</dt><dd>5.x route strings have no <code>?</code> modifier (<a href="#optional-param-boot-crash"><code>optional-param-boot-crash</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-wildcard-param-zero">
+<h3>40. TypeScript with <code>@types/express</code> 5.0.6: <code>'/files/*'</code> read as <code>req.params['0']</code> fails to compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-wildcard-param-zero</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Conversion of type '{ "": string[]; }' to type 'Record&lt;string, string>' may be a mistake</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">app.get('/files/*', (req, res) => {
+  const file = (req.params as Record&lt;string, string>)['0'];
+  res.sendFile(file, { root });
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">app.get('/files/*filepath', (req, res) => {
+  res.sendFile(req.params.filepath.join('/'), { root });
+});</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> catches the unnamed wildcard only because the handler reads <code>req.params['0']</code>.</dd>
+<dt>cause</dt><dd>5.x wildcards need a name and capture an array (<a href="#wildcard-route-boot-crash"><code>wildcard-route-boot-crash</code></a>, <a href="#wildcard-param-is-array"><code>wildcard-param-is-array</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-old-types-listen-callback">
+<h3>41. TypeScript with the old <code>@types/express</code> 4.17.25: the 5.x <code>app.listen</code> error callback does not compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-old-types-listen-callback</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>error TS2769: No overload matches this call
+Argument of type '(err: any) => void' is not assignable to parameter of type '() => void'.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-sh">npm install express@5   # @types/express stays at 4.17.25</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-sh">npm install -D @types/express@5</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> rejects correct Express 5 code: <code>app.listen(3000, (err) => …)</code>.</dd>
+<dt>cause</dt><dd><code>@types/express</code> was not bumped with <code>express</code> (<a href="#types-express-not-bumped"><code>types-express-not-bumped</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-old-types-wildcard-name">
+<h3>42. TypeScript with the old <code>@types/express</code> 4.17.25: a named wildcard parameter does not compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-old-types-wildcard-name</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Property 'filepath' does not exist on type '{}'</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-sh">npm install express@5   # @types/express stays at 4.17.25</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-sh">npm install -D @types/express@5</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> rejects correct Express 5 code: <code>'/files/*filepath'</code> read as <code>req.params.filepath</code>.</dd>
+<dt>cause</dt><dd><code>@types/express</code> was not bumped with <code>express</code> (<a href="#types-express-not-bumped"><code>types-express-not-bumped</code></a>).</dd>
+</dl>
+</article>
+<article id="ts-old-types-optional-segment">
+<h3>43. TypeScript with the old <code>@types/express</code> 4.17.25: an optional segment <code>{/:month}</code> does not compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-old-types-optional-segment</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Property 'year' does not exist on type '{ "year{": string; } &amp; { "month}": string; }'</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-sh">npm install express@5   # @types/express stays at 4.17.25</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-sh">npm install -D @types/express@5</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> rejects correct Express 5 code: <code>'/archive/:year{/:month}'</code> read as <code>req.params.year</code>.</dd>
+<dt>cause</dt><dd><code>@types/express</code> was not bumped with <code>express</code> (<a href="#types-express-not-bumped"><code>types-express-not-bumped</code></a>).</dd>
+</dl>
+</article>
+<article id="header-charset-lowercase">
+<h3>44. <code>charset=UTF-8</code> becomes <code>charset=utf-8</code> on static, <code>sendFile</code> and <code>download</code> responses</h3>
+<dl>
+<dt>id</dt><dd><code>header-charset-lowercase</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># Content-Type parameter on 4.22.3
+charset=UTF-8</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># Content-Type parameter on 5.3.0; no code change, update exact-match header assertions
+charset=utf-8</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 the <code>Content-Type</code> charset is lowercase on <code>express.static</code>, <code>res.sendFile</code> and <code>res.download</code> responses. Header-only: all functional checks pass. Untested inference: tests or clients that compare the header exactly will fail.</dd>
+<dt>cause</dt><dd>The cause was not investigated; only the response headers were compared.</dd>
+</dl>
+</article>
+<article id="header-js-mime-type">
+<h3>45. <code>.js</code> and <code>.mjs</code> are served as <code>text/javascript</code> instead of <code>application/javascript</code></h3>
+<dl>
+<dt>id</dt><dd><code>header-js-mime-type</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># .js / .mjs Content-Type on 4.22.3
+application/javascript</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># .js / .mjs Content-Type on 5.3.0; no code change, update exact-match header assertions
+text/javascript</code></pre></dd>
+<dt>symptom</dt><dd>Header-only: all functional checks pass. Untested inference: tests or clients that compare the header exactly will fail.</dd>
+<dt>cause</dt><dd>5.x looks up types with <code>mime-types</code> 3.0.2; 4.x used <code>mime</code> 1.6.0.</dd>
+</dl>
+</article>
+<article id="header-ico-webmanifest">
+<h3>46. <code>.ico</code> becomes <code>image/vnd.microsoft.icon</code>, and <code>.webmanifest</code> gains <code>; charset=utf-8</code></h3>
+<dl>
+<dt>id</dt><dd><code>header-ico-webmanifest</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># Content-Type on 4.22.3
+.ico          image/x-icon
+.webmanifest  (no charset parameter)</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># Content-Type on 5.3.0; no code change, update exact-match header assertions
+.ico          image/vnd.microsoft.icon
+.webmanifest  ; charset=utf-8 appended</code></pre></dd>
+<dt>symptom</dt><dd>Header-only: all functional checks pass. Untested inference: tests or clients that compare the header exactly will fail.</dd>
+<dt>cause</dt><dd>5.x looks up types with <code>mime-types</code> 3.0.2; 4.x used <code>mime</code> 1.6.0.</dd>
+</dl>
+</article>
+<article id="auto-options-response">
+<h3>47. Automatic <code>OPTIONS</code> responses change: <code>Allow</code> order and spacing, <code>text/plain</code>, <code>nosniff</code></h3>
+<dl>
+<dt>id</dt><dd><code>auto-options-response</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># automatic OPTIONS response on 4.22.3
+Allow: GET,POST,HEAD
+media type: text/html</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># automatic OPTIONS response on 5.3.0; no code change, update exact-match header assertions
+Allow: GET, HEAD, POST
+media type: text/plain
+X-Content-Type-Options: nosniff</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 the automatic <code>OPTIONS</code> response lists <code>Allow</code> as <code>GET, HEAD, POST</code> instead of <code>GET,POST,HEAD</code>, is <code>text/plain</code> instead of <code>text/html</code>, and adds <code>X-Content-Type-Options: nosniff</code>. Header-only: all functional checks pass.</dd>
+<dt>cause</dt><dd>The cause was not investigated; only the response headers were compared.</dd>
+</dl>
+</article>
+<article id="clear-cookie-max-age">
+<h3>48. <code>res.clearCookie(name, opts)</code> with <code>maxAge</code> in <code>opts</code> now really clears the cookie</h3>
+<dl>
+<dt>id</dt><dd><code>clear-cookie-max-age</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># Set-Cookie from res.clearCookie(name, { maxAge, … }) on 4.22.3: an empty cookie that lives on
+Max-Age=86400</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># on 5.3.0 the cookie is cleared; no code change needed
+Expires=Thu, 01 Jan 1970 00:00:00 GMT</code></pre></dd>
+<dt>symptom</dt><dd>On 4.22.3 <code>res.clearCookie</code> re-set an empty cookie with <code>Max-Age=86400</code>; on 5.3.0 it sends <code>Expires=Thu, 01 Jan 1970 00:00:00 GMT</code>, so the cookie really is cleared. Header-only: all functional checks pass.</dd>
+<dt>cause</dt><dd>5.x ignores <code>maxAge</code> in <code>res.clearCookie</code> options. 4.22.3 printed a deprecation warning for it, which was left unfixed during testing because 5.x ignores the option.</dd>
+</dl>
+</article>
+<article id="download-filename-non-ascii">
+<h3>49. <code>res.download</code> with a non-ASCII filename sends an ASCII fallback plus <code>filename*</code></h3>
+<dl>
+<dt>id</dt><dd><code>download-filename-non-ascii</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># Content-Disposition for res.download(file, 'Q3 résumé.csv') on 4.22.3
+filename="Q3 résumé.csv"</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># on 5.3.0; no code change, update exact-match header assertions
+filename="Q3 r?sum?.csv"; filename*=UTF-8''Q3%20r%C3%A9sum%C3%A9.csv</code></pre></dd>
+<dt>symptom</dt><dd>On 5.3.0 the plain <code>filename</code> holds an ASCII fallback with <code>?</code> for each non-ASCII character, and the real name moves to <code>filename*</code>. Header-only: all functional checks pass.</dd>
+<dt>cause</dt><dd>5.x formats the header with <code>content-disposition</code> 2.0.1; 4.x used 0.5.4.</dd>
+</dl>
+</article>
+<article id="async-handler-errors-caught">
+<h3>50. Improvement: a throwing <code>async</code> handler now returns 500 instead of killing the process</h3>
+<dl>
+<dt>id</dt><dd><code>async-handler-errors-caught</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">// 4.x: async errors had to be caught and passed on by hand
+app.get('/report', async (req, res, next) => {
+  try {
+    res.json(await buildReport());
+  } catch (err) {
+    next(err);
+  }
+});</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// 5.x: a throw inside an async handler reaches the error middleware
+app.get('/report', async (req, res) => {
+  res.json(await buildReport());
+});</code></pre></dd>
+<dt>symptom</dt><dd>On 4.22.3, an <code>async</code> handler that throws with no try/catch killed the whole process (exit 1; the client got <code>ECONNRESET socket hang up</code>). On 5.3.0 the error reaches the error middleware, the client gets a 500 and the server keeps serving. Nothing to fix; listed because the behaviour changed.</dd>
+<dt>cause</dt><dd>5.x passes errors thrown in <code>async</code> handlers to the error middleware. Untested: express-async-errors patches <code>express/lib/router/layer</code>, which no longer exists in 5.x.</dd>
+</dl>
+</article>
+</section>
+<section id="upgrade-order">
+<h2>Recommended upgrade order</h2>
+<p>Do everything except the route rewrites on 4.x first. Then bump Express, bump <code>@types/express</code> and rewrite the routes in one commit, because the two route syntaxes do not mix.</p>
+<ol>
+<li><strong>On 4.x, clear every deprecation warning.</strong> Run the whole test suite with stderr visible and fix each <code>express deprecated</code> and <code>body-parser deprecated</code> line. A warning appears only when its line runs, so coverage matters. Every fix applied for them ran on 4.22.3; the <code>clearCookie</code> <code>maxAge</code> one was left alone, since 5.x ignores that option.</li>
+<li><strong>Still on 4.x, ship the fixes that work on both versions.</strong> All of these ran on 4.22.3:
+<ul>
+<li><code>app.set('query parser', 'extended')</code> if any client sends bracket queries (<a href="#bracket-query-not-parsed">bracket-query-not-parsed</a>)</li>
+<li>stop writing to <code>req.query</code>, or add the writable-copy shim (<a href="#req-query-writes-lost">req-query-writes-lost</a>)</li>
+<li>default <code>req.body</code> to <code>{}</code> after the parsers (<a href="#req-body-undefined">req-body-undefined</a>)</li>
+<li><code>app.listen(PORT, (err) => { if (err) throw err; … })</code> (<a href="#listen-error-swallowed">listen-error-swallowed</a>)</li>
+<li><code>{ root }</code> on every <code>res.sendFile</code> and <code>res.download</code> (<a href="#sendfile-dot-folder-404">sendfile-dot-folder-404</a>)</li>
+<li>a dedicated <code>/.well-known</code> static mount (<a href="#well-known-not-served">well-known-not-served</a>)</li>
+<li><code>res.redirect(req.get('Referrer') || '/')</code> instead of <code>'back'</code> (<a href="#redirect-back-literal">redirect-back-literal</a>)</li>
+<li><code>express.urlencoded({ extended: true })</code> wherever the options are missing (<a href="#urlencoded-default-not-extended">urlencoded-default-not-extended</a>)</li>
+<li><code>router.param</code> validation instead of an inline <code>(regex)</code> in a path (<a href="#inline-regex-boot-crash">inline-regex-boot-crash</a>)</li>
+<li><code>app.use(cors())</code> instead of <code>app.options('*', cors())</code> (<a href="#cors-readme-options-star">cors-readme-options-star</a>)</li>
+</ul></li>
+<li><strong>List every route string and <code>req.query</code> write before the bump</strong>, with the two commands in <a href="#find-affected-code">Find affected code first</a>. Startup reports only one bad pattern per boot. Paths built from variables or arrays won't match; check those by hand.</li>
+<li><strong>In one commit, bump and rewrite together.</strong> Run <code>npm install express@5</code> and <code>npm install -D @types/express@5</code>. Rewrite <code>X/*</code> to <code>X/{*name}</code> and <code>:x?</code> to <code>{/:x}</code>, and read wildcard captures as arrays (<code>.join('/')</code>). Old patterns crash 5.x, and new ones silently mis-match on 4.x.</li>
+<li><strong>Boot until it starts, then fix the types.</strong> Each start names one <code>PathError</code>; search the code for its <code>originalPath</code>. Then fix the <code>tsc</code> errors, which now find the removed APIs.</li>
+<li><strong>Test the silent cases on purpose.</strong> Send a trailing-slash request to each guard (<code>/admin/</code>), bracket queries, pagination defaults and a POST with no body. Fetch <code>/.well-known/*</code>, walk any <code>redirect('back')</code> flow, download from the real deploy path, and start on a busy port. Diff response headers if tests or clients compare them exactly.</li>
+<li><strong>Deploy, then confirm what is running.</strong> Log <code>require('express/package.json').version</code> at boot and make sure the old process is gone. On 5.x a second server on a busy port prints "listening" and exits 0 while the old one keeps answering.</li>
+</ol>
+</section>
+<section id="companion-packages">
+<h2>Companion packages</h2>
+<p>The four most-downloaded companions, picked by npm weekly downloads from the registry search index (dated 2026-10-16 to 10-20), leaving out body-parser and serve-static, which Express itself depends on. Each was tested with identical code on 4.22.3 and 5.3.0. None refused to install or declared incompatibility with Express 5, and three behave identically; the fallout is two broken examples in the cors README and a stale <code>@types/express</code>. Every cell is observed.</p>
+<table>
+<thead><tr><th>Package · weekly downloads</th><th>Installs on 5?</th><th>Declares Express 5 support?</th><th>Actually works?</th><th>Workaround</th></tr></thead>
+<tbody>
+<tr><td>cors 2.8.6 · 52.5M</td><td>Yes, before and after the bump; no warnings</td><td>Says nothing: no <code>peerDependencies</code>, engines <code>node >= 0.10</code>, last publish 2026-01-22</td><td>Yes: <code>app.use(cors())</code>, pre-flight, per-route and an origin allow-list all match 4.x. Its README examples do not: <code>app.options('*', cors())</code> crashes at startup (<a href="#cors-readme-options-star">cors-readme-options-star</a>) and <code>app.del('/products/:id', cors(), …)</code> throws (<a href="#app-del-removed">app-del-removed</a>)</td><td><code>app.use(cors())</code> handles pre-flight on 4 and 5. <code>app.options('/{*splat}', cors())</code> works on 5 only: on 4 it answers 200 with no CORS headers</td></tr>
+<tr><td>express-rate-limit 8.7.1 · 42.6M</td><td>Yes</td><td>Yes: <code>peerDependencies</code> <code>express: ">= 4.11"</code></td><td>Yes: limits, 429 bodies, rate-limit headers, per-client counting behind <code>trust proxy</code>, the <code>ERR_ERL_UNEXPECTED_X_FORWARDED_FOR</code> warning and path mounting all match 4.x</td><td>None needed</td></tr>
+<tr><td>@types/express · 38.7M</td><td>Yes, but <code>npm install express@5</code> leaves 4.17.25 in place with no message</td><td>A separate 5.x line exists (5.0.6, published 2025-12-01). No peer link to express, so nothing flags the mismatch</td><td>4.17.25: <code>tsc</code> passes code that crashes at boot. 5.0.6: accepts the Express 5 rewrites (wildcards, optional segments, the listen error callback, the <code>req.query</code> shim), catches 7 problems and misses 10 (<a href="#types-express-not-bumped">types-express-not-bumped</a>)</td><td>Bump to 5.x in the upgrade commit; never treat a clean <code>tsc</code> as proof</td></tr>
+<tr><td>compression 1.8.2 · 26.7M</td><td>Yes</td><td>Says nothing: no <code>peerDependencies</code></td><td>Yes: gzip, brotli, the 1 kb threshold, <code>express.static</code>, <code>sendFile</code> and <code>res.flush</code> all match 4.x</td><td>None needed</td></tr>
+</tbody>
+</table>
+<p>No new companion package was needed for these four. Untested: <code>@as-integrations/express5</code> (600k weekly downloads) suggests Apollo users need one. Neither express 4.22.3 nor 5.3.0 declares a <code>bin</code>.</p>
+</section>
+<section id="versions">
+<h2>Versions tested</h2>
+<table>
+<thead><tr><th>Package</th><th>Before</th><th>After</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>express</td><td>4.22.3</td><td>5.3.0</td><td>latest 4.x (published 2026-09-14) and latest 5.x (published 2026-10-09)</td></tr>
+<tr><td>path-to-regexp</td><td>0.1.13</td><td>8.4.2</td><td>the route-syntax engine, now inside the new <code>router</code> 2.2.0</td></tr>
+<tr><td>body-parser</td><td>1.20.8</td><td>2.3.0</td><td></td></tr>
+<tr><td>send / serve-static</td><td>0.19.2 / 1.16.3</td><td>1.2.1 / 2.2.1</td><td></td></tr>
+<tr><td>finalhandler</td><td>1.3.2</td><td>2.1.1</td><td></td></tr>
+<tr><td>mime / mime-types</td><td>mime 1.6.0</td><td>mime-types 3.0.2</td><td><code>mime</code> removed</td></tr>
+<tr><td>content-disposition</td><td>0.5.4</td><td>2.0.1</td><td></td></tr>
+<tr><td>cors</td><td>2.8.6</td><td>2.8.6</td><td></td></tr>
+<tr><td>express-rate-limit</td><td>8.7.1</td><td>8.7.1</td><td></td></tr>
+<tr><td>compression</td><td>1.8.2</td><td>1.8.2</td><td></td></tr>
+<tr><td>@types/express</td><td>4.17.25</td><td>4.17.25, or 5.0.6 if bumped</td><td><code>@types/express-serve-static-core</code> 4.19.9 / 5.1.3</td></tr>
+<tr><td>typescript (test tool only)</td><td>7.0.2</td><td>7.0.2</td><td></td></tr>
+</tbody>
+</table>
+<p>Runtime: Linux, Node v22.22.0, npm 10.9.4, run on 21 October 2026 (UTC).</p>
+<p>Version proof: before every run the harness asked the installed package for its version (<code>require('express/package.json').version</code> and <code>require.resolve('express')</code>), refused to start on a busy port, and checked the server's boot line. It then checked <code>X-Express-Version</code> and <code>X-Server-Pid</code> on every response. The 24 saved result files hold 1,915 responses and none is unverified; after the upgrade only one copy of express existed on disk.</p>
+<p>Effort: about 67 minutes of wall clock (56 working), 80 shell commands and 26 harness runs. The app passed 99/99 checks on 4.22.3 at baseline; bringing it to identical behaviour on 5.3.0 took 17 fixes and 60 changed lines.</p>
+</section>
+<section id="not-verified">
+<h2>Not verified</h2>
+<p>The companion-package phase was cut to four packages, npm's download API was blocked, and everything ran on one machine with one Node version and one package manager.</p>
+<ul>
+<li><strong>51 ranked companion packages were not tested.</strong> Nothing below the top four was installed or run. In download order: http-proxy-middleware (13.7M a week), multer (12.9M), @opentelemetry/instrumentation-express (11.5M), supertest (10.4M), helmet (9.6M), connect-history-api-fallback (8.9M), serve-index (8.6M), morgan (7.7M), cookie-parser (6.7M), @nestjs/platform-express (6.6M), passport (4.6M), pino-http (3.7M), express-session (2.5M), swagger-ui-express (2.4M), errorhandler, @apollo/server, serve-favicon, method-override, express-validator, connect-redis, @as-integrations/express5, express-basic-auth, express-prom-bundle, express-unless, express-async-errors, express-promise-router, express-jwt, memorystore, express-winston, express-http-proxy, express-fileupload, response-time, express-openapi-validator, cookie-session, express-static-gzip, serverless-http, express-handlebars, express-mongo-sanitize, connect-timeout, express-ws, express-async-handler, connect-flash, connect-mongo, hpp, vhost, express-list-endpoints, express-slow-down, express-openid-connect, celebrate, express-ejs-layouts and express-generator.</li>
+<li><strong>csurf and xss-clean</strong> did not appear in npm search at all, and why was not established.</li>
+<li><strong>Never on the candidate list:</strong> template engines (ejs, pug, handlebars), ORMs and database drivers, Sentry and other APM agents, and GraphQL servers other than Apollo.</li>
+<li><strong>Likely breakers, untested</strong> (hypotheses from the probes): express-async-errors patches <code>express/lib/router/layer</code>, which no longer exists. express-list-endpoints reads <code>app._router</code>. express-mongo-sanitize and hpp reassign <code>req.query</code>, which throws in strict mode. @opentelemetry/instrumentation-express patches router internals, and @apollo/server has a separate <code>@as-integrations/express5</code> package.</li>
+<li><strong>Download counts</strong> came from the registry search API's <code>downloads.weekly</code> (npm's own index, dated 2026-10-16 to 10-20), because the test environment's network policy blocked api.npmjs.org. They were not cross-checked against the official downloads API.</li>
+<li><strong>The <code>express</code> command name</strong> (the CLI from express-generator) was not checked for collisions.</li>
+<li><strong>Older companion versions:</strong> only the latest of each was tested. A project pinned to an older major that declares <code>express ^4</code> could hit <code>ERESOLVE</code>; not tested.</li>
+<li><strong>One environment:</strong> Linux, Node 22.22.0 and npm 10.9.4. Not tested: Node 18 or 20 (Express 5 declares <code>node >= 18</code>), Windows, macOS, pnpm, yarn or Docker. Whether pnpm's <code>node_modules/.pnpm</code> store path trips the dot-directory <code>sendFile</code> change is a hypothesis.</li>
+<li><strong>App shape:</strong> CommonJS only. Strict-mode behaviour was shown with TypeScript output and strict functions, not a real ESM app. <code>NODE_ENV=production</code> was never set. There was no HTTP/2, TLS, real reverse proxy, database, session store, upload handling or auth library.</li>
+<li><strong>Inferences, not observations:</strong> that ACME (Let's Encrypt) HTTP-01 challenges under <code>/.well-known/</code> would fail; that dropping <code>(\\d+)</code> sends paths like <code>/users/search</code> into an id handler; that the header changes break clients or exact-header tests.</li>
+<li><strong>The release notes</strong> were deliberately not read, so which of these findings the Express 5 changelog or migration guide already documents is unknown.</li>
+<li><strong>TypeScript:</strong> only TypeScript 7.0.2 and only <code>@types/express</code>. Other <code>@types/*</code> packages that depend on it were not checked for version conflicts.</li>
+<li><strong>The four companions</strong> ran in small test apps that load the upgraded project's installed packages; they were not wired into the main app.</li>
+<li><strong>The harness:</strong> every check passed on 4.x first, and full header and body diffs caught what checks didn't assert, but code paths the app doesn't have are untested. Requests went one at a time, with no load or performance comparison.</li>
+<li><strong>The evidence:</strong> the harness, experiment scripts and raw results existed only in the temporary workspace used for the run; nothing was committed to a shared repository.</li>
+</ul>
+</section>
+</main>
+<footer>
+<p>Report by @Arjun, 21 October 2026. JSON: <a href="/express/4-to-5.json">/express/4-to-5.json</a>. All reports: <a href="/">/</a>. Agent index: <a href="/llms.txt">/llms.txt</a>.</p>
+</footer>
+</body>
+</html>
