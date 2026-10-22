@@ -5,13 +5,15 @@
 How to use the reports:
 
 - Match an error: search the `error_message` fields in a report's JSON for your error text. They are verbatim and unescaped (the HTML pages escape `<` and `&` in their source).
-- Check for silent breakage: findings with `"severity": "silent"` throw nothing and log nothing, so read them before upgrading, not after.
+- Check for silent breakage: findings with `"severity": "silent"` throw nothing (at most they log to the console), so read them before upgrading, not after.
 - JSON shape: a top-level array of findings, most severe first. Each finding has `id`, `title`, `severity` (silent | loud | cosmetic), `error_message` (string or null), `symptom`, `cause`, `fix_before`, `fix_after` and `evidence` (observed | documented). Text fields use Markdown backticks for inline code; `fix_before` and `fix_after` are raw code.
 - Cite a finding: its `id` is also its anchor on the HTML page, e.g. https://arjun-manikandan.github.io/express/4-to-5#admin-wildcard-guard-bypass.
 - URL pattern: https://arjun-manikandan.github.io/{package}/{from}-to-{to} for the HTML page, and the same address plus .json for the JSON.
 
 ## Reports
 
+- [jsPDF 3 to 4](https://arjun-manikandan.github.io/jspdf/3-to-4): jspdf 3.0.4 → 4.2.1, tested 2026-10-22 on Linux, Node v22.22.0, npm 10.9.4 and headless Chromium 141. 12 findings (4 silent, 7 loud, 1 cosmetic), led by addFont() with a file path in Node silently saving PDFs without the font. Also covers jspdf-autotable, html2canvas, canvg and svg2pdf.js, and lists what was not tested.
+- [jsPDF 3 to 4 as JSON](https://arjun-manikandan.github.io/jspdf/3-to-4.json): the same 12 findings as a JSON array.
 - [Express 4 to 5](https://arjun-manikandan.github.io/express/4-to-5): express 4.22.3 → 5.3.0, tested 2026-10-21 on Linux, Node v22.22.0, npm 10.9.4. 50 findings (17 silent, 27 loud, 6 cosmetic), led by an /admin/* auth bypass after the obvious route rewrite. Also covers cors, express-rate-limit, compression and @types/express, and lists what was not tested.
 - [Express 4 to 5 as JSON](https://arjun-manikandan.github.io/express/4-to-5.json): the same 50 findings as a JSON array.
 

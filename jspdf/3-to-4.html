@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jsPDF 3 to 4 upgrade: observed breakages and fixes (3.0.4 to 4.2.1)</title>
+<meta name="description" content="12 findings from running a real jsPDF app on 3.0.4 and 4.2.1, tested 22 October 2026: verbatim error messages with fixes, silent output changes, and fonts loaded by file path in Node that silently stop embedding. The same findings as JSON: /jspdf/3-to-4.json.">
+<link rel="canonical" href="https://arjun-manikandan.github.io/jspdf/3-to-4">
+<link rel="alternate" type="application/json" href="/jspdf/3-to-4.json" title="Findings as JSON">
+<style>
+body{max-width:52rem;margin:0 auto;padding:0 1rem;font:16px/1.5 system-ui,sans-serif}
+pre{background:#f4f4f4;padding:.5rem;white-space:pre-wrap;overflow-wrap:anywhere}
+table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:.25rem .5rem;text-align:left;vertical-align:top}
+dt{font-weight:bold}article{border-top:1px solid #ccc;margin-top:2rem}
+</style>
+</head>
+<body>
+<header>
+<h1>jsPDF 3 to 4 upgrade: what broke, verbatim errors, and fixes</h1>
+<p>Versions tested: jspdf 3.0.4 upgraded to jspdf 4.2.1, on 22 October 2026 (UTC), on Linux with Node v22.22.0 and npm 10.9.4, and in headless Chromium 141. Method: a real 175-line jsPDF 3 app, which writes 6 PDFs (17 pages) with text and fonts, images, a jspdf-autotable table, mixed page sizes and <code>.html()</code>, was run on both versions in Node and in the browser, and every failure was recorded as it happened. Because a PDF can generate without error and still be wrong, every PDF was also compared across versions: bytes, structure, embedded fonts, images, extracted text and rendered pixels. Small probe scripts then tested the areas that a diff of the two versions' built code showed had changed, and older add-on versions were installed to test <code>npm ci</code>. Every run first checked that the intended jsPDF version was the one running. These findings are observed, not summarised: none comes from the jsPDF release notes or changelog, which were deliberately not read, and anything that was not observed is marked untested.</p>
+<p>Summary: close to painless for browser code, and for any code that hands jsPDF its fonts and images as data: every baseline PDF came out byte-identical to 3.0.4, covering text, custom fonts, images, autotable tables, multi-page layouts and <code>.html()</code>. The pain is in Node code that passes file paths: <code>addImage(path)</code> now throws, <code>addFont(path)</code> silently saves the PDF without the font, and neither of the two remedies the error message names works as written. <code>addMetadata()</code> now XML-escapes its input, which silently changes XMP and PDF/A metadata, and projects still on jspdf-autotable &lt; 5.0.7 or svg2pdf.js &lt; 2.7.0 pass <code>npm install</code> locally but fail <code>npm ci</code>. Go straight to 4.2.1: <code>npm audit</code> flags <code>jspdf &lt;=4.2.0</code>, 3.0.4 included, as critical.</p>
+<p>Machine-readable copy: <a href="/jspdf/3-to-4.json">/jspdf/3-to-4.json</a> holds the same 12 findings in the same order, as a JSON array. Each finding has <code>id</code>, <code>title</code>, <code>severity</code> (<code>silent</code>: wrong output and nothing thrown, though jsPDF may log to the console; <code>loud</code>: throws, fails to compile or fails to install; <code>cosmetic</code>: the PDF bytes change and nothing breaks), <code>error_message</code> (verbatim, or <code>null</code>), <code>symptom</code>, <code>cause</code>, <code>fix_before</code>, <code>fix_after</code> and <code>evidence</code> (<code>observed</code> or <code>documented</code>). Each <code>id</code> is also the finding's anchor on this page. For exact string matching use the JSON, because this page's source escapes <code>&lt;</code> and <code>&amp;</code>.</p>
+<p>Report by @Arjun, <time datetime="2026-10-22">22 October 2026</time>.</p>
+</header>
+<main>
+<nav id="index" aria-label="Findings index">
+<h2>Findings index</h2>
+<table>
+<thead><tr><th>#</th><th>severity</th><th>finding</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>silent</td><td><a href="#add-font-file-path-not-embedded"><code>addFont()</code> with a file path in Node saves the PDF without the font, and nothing is thrown</a></td></tr>
+<tr><td>2</td><td>silent</td><td><a href="#add-metadata-double-escaped"><code>addMetadata()</code> now XML-escapes its input, so text escaped in advance, as the 3.x JSDoc asked, is escaped twice</a></td></tr>
+<tr><td>3</td><td>silent</td><td><a href="#add-metadata-xmp-markup-becomes-text"><code>addMetadata()</code> with XMP markup stores it as escaped text, so the PDF/A identification (<code>pdfaid:part</code>) disappears</a></td></tr>
+<tr><td>4</td><td>silent</td><td><a href="#acroform-names-with-spaces">AcroForm names containing a space: the selected radio button renders differently, and the file is still malformed</a></td></tr>
+<tr><td>5</td><td>loud</td><td><a href="#add-image-file-path-throws"><code>addImage()</code> with a file path throws in Node, and no PDF is produced</a></td></tr>
+<tr><td>6</td><td>loud</td><td><a href="#npm-ci-eresolve-old-addons">With jspdf-autotable older than 5.0.7 or svg2pdf.js older than 2.7.0, <code>npm install jspdf@4</code> passes but <code>npm ci</code> fails with <code>ERESOLVE</code></a></td></tr>
+<tr><td>7</td><td>loud</td><td><a href="#allow-fs-read-static-ignored">Setting <code>jsPDF.allowFsRead</code>, as the error message says, has no effect</a></td></tr>
+<tr><td>8</td><td>loud</td><td><a href="#doc-allow-fs-read-skips-add-image"><code>doc.allowFsRead</code>, the form in the JSDoc and the typings, fixes <code>addFont</code> but not <code>addImage</code></a></td></tr>
+<tr><td>9</td><td>loud</td><td><a href="#allow-fs-read-symlink-rejected">An <code>allowFsRead</code> entry that goes through a symlink is rejected with "Permission denied"</a></td></tr>
+<tr><td>10</td><td>loud</td><td><a href="#node-permission-flag-breaks-save">Running Node with <code>--permission --allow-fs-read</code>, the other remedy the error message names, makes <code>doc.save()</code> and Playwright throw</a></td></tr>
+<tr><td>11</td><td>loud</td><td><a href="#ts-allow-fs-read-not-typed">TypeScript with jsPDF 4.2.1's own types: <code>jsPDF.API.allowFsRead</code>, the opt-in that works, fails to compile</a></td></tr>
+<tr><td>12</td><td>cosmetic</td><td><a href="#add-js-parentheses-escaped"><code>addJS()</code> and <code>autoPrint({ variant: 'javascript' })</code> now escape parentheses in the PDF's JavaScript</a></td></tr>
+</tbody>
+</table>
+</nav>
+<section id="findings">
+<h2>Findings, most severe first</h2>
+<p>Order: silent changes first (nothing is thrown, so they ship unnoticed), then loud errors, most likely to hit a typical project first, with the compile-time error last, then the byte-level change. Every finding in this report was observed by running code. In each finding the verbatim <code>error_message</code> comes first, with <code>fix_before</code> and <code>fix_after</code> directly below it. The file-path findings apply to Node only: browser-only projects need <a href="#npm-ci-eresolve-old-addons">npm-ci-eresolve-old-addons</a>, plus the <code>addMetadata</code> and AcroForm findings if they use those.</p>
+<article id="add-font-file-path-not-embedded">
+<h3>1. <code>addFont()</code> with a file path in Node saves the PDF without the font, and nothing is thrown</h3>
+<dl>
+<dt>id</dt><dd><code>add-font-file-path-not-embedded</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>jsPDF PubSub Error Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.
+jsPDF PubSub Error Cannot read properties of undefined (reading 'widths')</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">doc.addFont('assets/DejaVuSans-Bold.ttf', 'DejaVu', 'bold');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// works on 3.x and 4.x; the output is byte-identical to 3.0.4
+doc.addFileToVFS('DejaVuSans-Bold.ttf', fs.readFileSync('assets/DejaVuSans-Bold.ttf').toString('base64'));
+doc.addFont('DejaVuSans-Bold.ttf', 'DejaVu', 'bold');</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1, in Node, <code>doc.addFont(path, …)</code> throws nothing. jsPDF logs two errors to <code>console.error</code> (their first lines are above), and <code>doc.save()</code> still writes the PDF, without the font: <code>pdffonts</code> lists it under its file path as a Type 1 font with <code>emb</code> <code>no</code>, viewers substitute another face (poppler drew a condensed one), <code>✓</code> drops out of the extracted text, and the file shrank from 287,901 to 149,987 bytes. On 3.0.4 the same call embedded the font. No exception reaches your code; the console is the only signal.</dd>
+<dt>cause</dt><dd>In Node, 4.2.1 refuses to read local files unless you opt in, so the font file is never read (the same block as <a href="#add-image-file-path-throws"><code>add-image-file-path-throws</code></a>). <code>addFont</code> reports the failure through jsPDF's internal PubSub, which logs it instead of throwing.</dd>
+</dl>
+</article>
+<article id="add-metadata-double-escaped">
+<h3>2. <code>addMetadata()</code> now XML-escapes its input, so text escaped in advance, as the 3.x JSDoc asked, is escaped twice</h3>
+<dl>
+<dt>id</dt><dd><code>add-metadata-double-escaped</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">doc.addMetadata('Tom &amp;amp; Jerry'); // escaped in advance, as the 3.x JSDoc asked</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// 4.x only: change it in the upgrade commit (on 3.0.4 this string gives XMP that won't parse)
+doc.addMetadata('Tom &amp; Jerry');</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1, <code>doc.addMetadata('Tom &amp;amp; Jerry &amp;lt;Q3&amp;gt; report')</code> stores the XMP value <code>Tom &amp;amp; Jerry &amp;lt;Q3&amp;gt; report</code>, with the entities as literal text. On 3.0.4 the value was <code>Tom &amp; Jerry &lt;Q3> report</code>. The pages render the same. No error.</dd>
+<dt>cause</dt><dd>4.x XML-escapes the string passed to <code>addMetadata()</code>; 3.x inserted it as it was, which is why its JSDoc asked for escaped input. Plain text gives valid XMP on 4.2.1 (the value reads <code>Tom &amp; Jerry</code>), but on 3.0.4 the same plain string gives XMP that an XML parser rejects (<code>ExpatError: not well-formed (invalid token)</code>), so the change has to ship with the upgrade.</dd>
+</dl>
+</article>
+<article id="add-metadata-xmp-markup-becomes-text">
+<h3>3. <code>addMetadata()</code> with XMP markup stores it as escaped text, so the PDF/A identification (<code>pdfaid:part</code>) disappears</h3>
+<dl>
+<dt>id</dt><dd><code>add-metadata-xmp-markup-becomes-text</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">doc.addMetadata('&lt;pdfaid:part xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">1&lt;/pdfaid:part>');</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// 4.x only: pass a complete XMP packet and true, in the upgrade commit
+doc.addMetadata('&lt;x:xmpmeta xmlns:x="adobe:ns:meta/">&lt;rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">&lt;rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">&lt;pdfaid:part>1&lt;/pdfaid:part>&lt;pdfaid:conformance>B&lt;/pdfaid:conformance>&lt;/rdf:Description>&lt;/rdf:RDF>&lt;/x:xmpmeta>', true);</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1 the XMP holds 0 <code>pdfaid:part</code> elements instead of 1: the markup is stored as escaped text, so the file no longer identifies itself as PDF/A. No error.</dd>
+<dt>cause</dt><dd>4.x escapes everything passed to <code>addMetadata()</code> (<a href="#add-metadata-double-escaped"><code>add-metadata-double-escaped</code></a>); markup goes through only in the new raw mode, <code>addMetadata(xmp, true)</code>, which takes a complete <code>x:xmpmeta</code> packet. Verified on 4.2.1: one <code>x:xmpmeta</code>, one <code>pdfaid:part</code>. On 3.0.4 the same call nests the packet inside jsPDF's own wrapper with <code>xmlns:jspdf="true"</code> and gives 2 <code>x:xmpmeta</code> elements, so make this change in the upgrade commit, not before.</dd>
+</dl>
+</article>
+<article id="acroform-names-with-spaces">
+<h3>4. AcroForm names containing a space: the selected radio button renders differently, and the file is still malformed</h3>
+<dl>
+<dt>id</dt><dd><code>acroform-names-with-spaces</code></dd>
+<dt>severity</dt><dd>silent</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">radio.createOption('Bank transfer');
+radio.value = 'Bank transfer';</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// names without spaces: identical output on 3.x and 4.x, and 0 poppler errors
+radio.createOption('bank_transfer');
+radio.value = 'bank_transfer';</code></pre></dd>
+<dt>symptom</dt><dd>With a radio-button group whose option and value names contain a space, the selected button shows a stray dark box on 4.2.1 and nothing on 3.0.4 (rendered with poppler). The file is malformed on both versions: poppler reports <code>Dictionary key must be a name object</code> errors, 68 on 3.0.4 and 36 on 4.2.1. jsPDF itself throws and logs nothing. Rare: only names with spaces are affected.</dd>
+<dt>cause</dt><dd>4.2.1 escapes the space in <code>/V</code> and <code>/AS</code> (<code>/V /Bank#20transfer</code>) but not in the appearance-dictionary (<code>/AP</code>) keys, which stay <code>/Bank transfer 12 0 R</code>, so the value no longer matches its appearance.</dd>
+</dl>
+</article>
+<article id="add-image-file-path-throws">
+<h3>5. <code>addImage()</code> with a file path throws in Node, and no PDF is produced</h3>
+<dl>
+<dt>id</dt><dd><code>add-image-file-path-throws</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">doc.addImage('assets/photo.jpg', 'JPEG', 55, 70, 100, 75);</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">// works on 3.x and 4.x; the output is byte-identical to 3.0.4
+doc.addImage(fs.readFileSync('assets/photo.jpg'), 'JPEG', 55, 70, 100, 75);
+// 4.x-only alternative, set before the first new jsPDF():
+// jsPDF.API.allowFsRead = [fs.realpathSync('assets') + '/*'];</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1, in Node, <code>addImage</code> with a file path throws and the PDF is not produced. <code>doc.loadFile(path)</code> throws the same message. On 3.0.4 the Node build read the file itself. Neither remedy the message names works as written (<a href="#allow-fs-read-static-ignored"><code>allow-fs-read-static-ignored</code></a>, <a href="#node-permission-flag-breaks-save"><code>node-permission-flag-breaks-save</code></a>).</dd>
+<dt>cause</dt><dd>In Node, 4.2.1 refuses to read local files unless you opt in. Passing the bytes works on both versions. The 4.x-only opt-in covers <code>addImage</code> only when set on <code>jsPDF.API</code>, must name the real path when a symlink is involved, and needs a cast in TypeScript (<a href="#doc-allow-fs-read-skips-add-image"><code>doc-allow-fs-read-skips-add-image</code></a>, <a href="#allow-fs-read-symlink-rejected"><code>allow-fs-read-symlink-rejected</code></a>, <a href="#ts-allow-fs-read-not-typed"><code>ts-allow-fs-read-not-typed</code></a>).</dd>
+</dl>
+</article>
+<article id="npm-ci-eresolve-old-addons">
+<h3>6. With jspdf-autotable older than 5.0.7 or svg2pdf.js older than 2.7.0, <code>npm install jspdf@4</code> passes but <code>npm ci</code> fails with <code>ERESOLVE</code></h3>
+<dl>
+<dt>id</dt><dd><code>npm-ci-eresolve-old-addons</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>npm error code ERESOLVE
+npm error ERESOLVE could not resolve
+npm error While resolving: jspdf-autotable@5.0.2
+npm error Found: jspdf@4.2.1
+npm error Could not resolve dependency:
+npm error peer jspdf@"^2 || ^3" from jspdf-autotable@5.0.2</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-sh">npm install jspdf@4</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-sh">npm install jspdf@4 jspdf-autotable@^5.0.7
+# with svg2pdf.js: npm install jspdf@4 svg2pdf.js@^2.7.0</code></pre></dd>
+<dt>symptom</dt><dd>In a project on jspdf 3.0.4 with jspdf-autotable 5.0.2 (also tested: 4.0.0) or svg2pdf.js 2.6.0, <code>npm install jspdf@4</code> exits 0, prints only <code>npm warn ERESOLVE overriding peer dependency</code> and leaves the old add-on in place; <code>npm ls</code> exits 0 too. The next <code>npm ci</code>, usually in CI, fails with exit code 1, in all 3 setups. At runtime the old add-ons work: their output is byte-identical on 3.0.4 and 4.2.1. With the fix, npm prints no warnings and <code>npm ci</code> exits 0.</dd>
+<dt>cause</dt><dd>jspdf-autotable declares jspdf 4 support (<code>^2 || ^3 || ^4</code>) only from 5.0.7, and svg2pdf.js (<code>^4.0.0 || ^3.0.0 || ^2.0.0</code>) only from 2.7.0, so jspdf-autotable 4.0.0–5.0.2 and svg2pdf.js 2.4.0–2.6.0 exclude jspdf 4. <code>npm install</code> overrides the conflict with a warning; <code>npm ci</code> refuses it.</dd>
+</dl>
+</article>
+<article id="allow-fs-read-static-ignored">
+<h3>7. Setting <code>jsPDF.allowFsRead</code>, as the error message says, has no effect</h3>
+<dl>
+<dt>id</dt><dd><code>allow-fs-read-static-ignored</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">jsPDF.allowFsRead = [dir + '/*']; // what the error message names: ignored</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">jsPDF.API.allowFsRead = [fs.realpathSync(dir) + '/*']; // 4.x only, before the first new jsPDF()
+// better: pass the bytes (see add-image-file-path-throws)</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1, after <code>jsPDF.allowFsRead = [dir + '/*']</code>, <code>addImage(path)</code> still throws the same message, and <code>addFont(path)</code> still logs <code>jsPDF PubSub Error</code> and leaves the font out.</dd>
+<dt>cause</dt><dd>The static property the message names is ignored. Set on the prototype, as <code>jsPDF.API.allowFsRead</code>, the same list made font, image and <code>loadFile</code> reads all work. <code>doc.allowFsRead</code> covers only some of them (<a href="#doc-allow-fs-read-skips-add-image"><code>doc-allow-fs-read-skips-add-image</code></a>).</dd>
+</dl>
+</article>
+<article id="doc-allow-fs-read-skips-add-image">
+<h3>8. <code>doc.allowFsRead</code>, the form in the JSDoc and the typings, fixes <code>addFont</code> but not <code>addImage</code></h3>
+<dl>
+<dt>id</dt><dd><code>doc-allow-fs-read-skips-add-image</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">doc.allowFsRead = [dir + '/*']; // covers addFont and loadFile, not addImage</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">jsPDF.API.allowFsRead = [fs.realpathSync(dir) + '/*']; // 4.x only, before the first new jsPDF()
+// better: pass the bytes (see add-image-file-path-throws)</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1, with <code>doc.allowFsRead = [dir + '/*']</code>, <code>addFont(path)</code> and <code>loadFile(path)</code> work, but <code>addImage(path)</code> on the same document still throws the same message.</dd>
+<dt>cause</dt><dd>The per-document opt-in does not reach <code>addImage</code>. It is the form in jsPDF's own JSDoc example and the only one in its TypeScript types, so the form that does cover <code>addImage</code> fails to compile (<a href="#ts-allow-fs-read-not-typed"><code>ts-allow-fs-read-not-typed</code></a>).</dd>
+</dl>
+</article>
+<article id="allow-fs-read-symlink-rejected">
+<h3>9. An <code>allowFsRead</code> entry that goes through a symlink is rejected with "Permission denied"</h3>
+<dl>
+<dt>id</dt><dd><code>allow-fs-read-symlink-rejected</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Cannot read file '/home/user/jspdf-upgrade/app/assets/photo.jpg'. Permission denied.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-js">jsPDF.API.allowFsRead = [LINK + '/*']; // LINK is a symlink to the assets folder, e.g. current -> releases/42</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-js">jsPDF.API.allowFsRead = [fs.realpathSync(LINK) + '/*'];</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1, when the allowlisted folder is reached through a symlink (as with a <code>current -> releases/N</code> deploy), <code>addImage</code> throws this message, and <code>addFont</code> logs it and leaves the font out. The path in the message is the file's real path, with the symlink resolved.</dd>
+<dt>cause</dt><dd>An allowlist entry written through the symlink does not match the resolved path; the same entry passed through <code>fs.realpathSync</code> does. Untested inference: on macOS, <code>/tmp</code> is a symlink to <code>/private/tmp</code>, so allowlisting a folder under <code>/tmp</code> would fail the same way.</dd>
+</dl>
+</article>
+<article id="node-permission-flag-breaks-save">
+<h3>10. Running Node with <code>--permission --allow-fs-read</code>, the other remedy the error message names, makes <code>doc.save()</code> and Playwright throw</h3>
+<dl>
+<dt>id</dt><dd><code>node-permission-flag-breaks-save</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>Access to this API has been restricted. Use --allow-fs-write to manage permissions.
+browserType.launch: Access to this API has been restricted. Use --allow-child-process to manage permissions.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-sh">node --permission --allow-fs-read=&lt;dir> app.js</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-sh">node --permission --allow-fs-read=&lt;dir> --allow-fs-write=&lt;dir> --allow-child-process app.js
+# better: don't turn on --permission just for jsPDF; pass the bytes instead (see add-image-file-path-throws)</code></pre></dd>
+<dt>symptom</dt><dd>Under <code>node --permission --allow-fs-read=&lt;dir></code>, <code>doc.save()</code> throws the first message, and launching Chromium through Playwright fails with the second. With the extra flags the full test app passed. 3.0.4 behaves the same under <code>--permission</code>.</dd>
+<dt>cause</dt><dd>This is Node's permission model, not a jsPDF regression: under <code>--permission</code>, writing files and starting child processes need flags of their own. A project meets it only by following the 4.x error message.</dd>
+</dl>
+</article>
+<article id="ts-allow-fs-read-not-typed">
+<h3>11. TypeScript with jsPDF 4.2.1's own types: <code>jsPDF.API.allowFsRead</code>, the opt-in that works, fails to compile</h3>
+<dl>
+<dt>id</dt><dd><code>ts-allow-fs-read-not-typed</code></dd>
+<dt>severity</dt><dd>loud</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd><pre><code>error TS2339: Property 'allowFsRead' does not exist on type 'jsPDFAPI'.</code></pre></dd>
+<dt>fix_before</dt><dd><pre><code class="language-ts">jsPDF.API.allowFsRead = [fs.realpathSync(dir) + '/*'];</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-ts">(jsPDF.API as any).allowFsRead = [fs.realpathSync(dir) + '/*'];</code></pre></dd>
+<dt>symptom</dt><dd><code>tsc</code> 6.0.2 with <code>--strict</code> rejects the assignment, with both <code>bundler</code> and <code>nodenext</code> module resolution. With the cast it reports 0 errors.</dd>
+<dt>cause</dt><dd>jsPDF 4.2.1's types declare <code>allowFsRead</code> only on the document (<code>doc.allowFsRead</code>), which does not cover <code>addImage</code> (<a href="#doc-allow-fs-read-skips-add-image"><code>doc-allow-fs-read-skips-add-image</code></a>).</dd>
+</dl>
+</article>
+<article id="add-js-parentheses-escaped">
+<h3>12. <code>addJS()</code> and <code>autoPrint({ variant: 'javascript' })</code> now escape parentheses in the PDF's JavaScript</h3>
+<dl>
+<dt>id</dt><dd><code>add-js-parentheses-escaped</code></dd>
+<dt>severity</dt><dd>cosmetic</dd>
+<dt>evidence</dt><dd>observed</dd>
+<dt>error_message</dt><dd>null</dd>
+<dt>fix_before</dt><dd><pre><code class="language-text"># JavaScript stored by doc.addJS('app.alert("Smile :)");') on 3.0.4: cut short
+app.alert("Smile :)"</code></pre></dd>
+<dt>fix_after</dt><dd><pre><code class="language-text"># on 4.2.1: stored whole; no code change needed
+app.alert("Smile :)");</code></pre></dd>
+<dt>symptom</dt><dd>On 4.2.1 the parentheses in the <code>/JS</code> string are escaped (<code>/JS (app.alert\("Smile :\)"\);)</code>), so the PDF bytes differ. Code with balanced parentheses, such as <code>app.alert("Hello (world)");</code>, reads back the same on both versions. Code with an unbalanced one, such as <code>app.alert("Smile :)");</code>, was cut short on 3.0.4 and is now stored whole. Nothing to fix; listed because the bytes changed.</dd>
+<dt>cause</dt><dd>4.x escapes <code>(</code> and <code>)</code> in the JavaScript string it writes. 3.x wrote them as they were, so an unbalanced <code>)</code> ended the PDF string early.</dd>
+</dl>
+</article>
+</section>
+<section id="upgrade-order">
+<h2>Recommended upgrade order</h2>
+<p>Make the file-path, AcroForm and add-on changes on 3.x first, because they work on both versions. Then bump jspdf straight to 4.2.1 and make the 4.x-only changes in the same commit.</p>
+<ol>
+<li><strong>Still on 3.x, make the changes that leave the output identical.</strong> Each of these was verified byte-identical on 3.0.4:
+<ul>
+<li>replace every <code>addImage</code>, <code>addFont</code> and <code>loadFile</code> call that passes a file path with the file's bytes (<code>fs.readFileSync</code>), using the VFS for fonts (<a href="#add-font-file-path-not-embedded">add-font-file-path-not-embedded</a>, <a href="#add-image-file-path-throws">add-image-file-path-throws</a>)</li>
+<li>rename AcroForm option and value names that contain spaces (<a href="#acroform-names-with-spaces">acroform-names-with-spaces</a>)</li>
+</ul></li>
+<li><strong>Still on 3.x, bump the add-ons:</strong> <code>npm install jspdf-autotable@^5.0.7 svg2pdf.js@^2.7.0</code>. Both still declare jspdf 3 support and ran correctly with 3.0.4 (<a href="#npm-ci-eresolve-old-addons">npm-ci-eresolve-old-addons</a>).</li>
+<li><strong>Upgrade straight to 4.2.1, not 4.0.0 to 4.2.0.</strong> <code>npm audit</code> flags <code>jspdf &lt;=4.2.0</code> as critical (GHSA-f8cm-6447-x5h2, local file inclusion and path traversal), and reports 0 vulnerabilities for 4.2.1. In the same commit, make the 4.x-only changes:
+<ul>
+<li>pass plain text to <code>addMetadata</code>, or a complete XMP packet with <code>true</code> (<a href="#add-metadata-double-escaped">add-metadata-double-escaped</a>, <a href="#add-metadata-xmp-markup-becomes-text">add-metadata-xmp-markup-becomes-text</a>)</li>
+<li>if you kept file paths, set <code>jsPDF.API.allowFsRead</code> to the folder's real path, with <code>as any</code> in TypeScript (<a href="#allow-fs-read-symlink-rejected">allow-fs-read-symlink-rejected</a>, <a href="#ts-allow-fs-read-not-typed">ts-allow-fs-read-not-typed</a>)</li>
+</ul></li>
+<li><strong>Verify:</strong> <code>npm ci</code> passes, no <code>jsPDF PubSub Error</code> appears in the logs, <code>pdffonts</code> shows <code>emb</code> <code>yes</code> for every custom font, and the XMP is right if you depend on PDF/A.</li>
+<li><strong>Don't turn on <code>node --permission</code> just for jsPDF</strong> (<a href="#node-permission-flag-breaks-save">node-permission-flag-breaks-save</a>). If you do, you also need <code>--allow-fs-write</code> and <code>--allow-child-process</code>.</li>
+</ol>
+</section>
+<section id="unchanged">
+<h2>No change observed</h2>
+<p>Once file paths were replaced with bytes, all 6 baseline PDFs and the 4 companion-tool PDFs were byte-identical between 3.0.4 and 4.2.1, after removing the creation date, the file ID, <code>/Producer</code> (which names the jsPDF version) and the cross-reference table. That covers:</p>
+<ul>
+<li>standard fonts in 7 styles, a TTF loaded through the VFS with non-Latin text, <code>getTextWidth</code>, <code>splitTextToSize</code>, alignment, justification and <code>maxWidth</code>, rotation, links and <code>setProperties</code></li>
+<li>images: an RGBA PNG from bytes, a palette PNG with transparency from a data URL, a JPEG from raw base64 with rotation, alias reuse with <code>'FAST'</code> compression, and <code>getImageProperties</code></li>
+<li>jspdf-autotable: a 7-page table with hooks, a footer, <code>compress: true</code> and <code>lastAutoTable.finalY</code></li>
+<li>mixed page sizes, <code>setPage</code>, <code>internal.getNumberOfPages()</code> and internal links</li>
+<li>in the browser: <code>.html()</code> from an element and from a string, the <code>doc.save()</code> download, <code>output('dataurlnewwindow')</code>, and <code>addImage(url)</code> and <code>addFont(url)</code></li>
+<li>TypeScript: the 4.2.1 types only add declarations, and typical calls compile the same way</li>
+</ul>
+</section>
+<section id="companion-packages">
+<h2>Companion packages</h2>
+<p>The four companion tools chosen for this test, with the weekly download counts given when it was set up. Each was run with identical code on 3.0.4 and 4.2.1. All four install and run on 4.2.1, and their PDFs are byte-identical to 3.0.4; canvg and svg2pdf.js each have one problem that is the same on 3.0.4. The fallout is in installation: older jspdf-autotable and svg2pdf.js versions make <code>npm ci</code> fail. Every cell is observed.</p>
+<table>
+<thead><tr><th>Package · weekly downloads</th><th>Installs on 4?</th><th>Declares jspdf 4 support?</th><th>Actually works?</th><th>Workaround</th></tr></thead>
+<tbody>
+<tr><td>jspdf-autotable 5.0.9 · 2.6M</td><td>Yes, no warnings</td><td>Yes: <code>peerDependencies</code> <code>jspdf: "^2 || ^3 || ^4"</code>, but only from 5.0.7. Versions 4.0.0 to 5.0.2 make <code>npm ci</code> fail (<a href="#npm-ci-eresolve-old-addons">npm-ci-eresolve-old-addons</a>)</td><td>Yes: byte-identical to 3.0.4 for a 7-page Node table and for the browser <code>doc.autoTable({html: '#tbl'})</code>, and every cell is extractable</td><td>Use 5.0.7 or later</td></tr>
+<tr><td>html2canvas 1.4.1 · 11.1M</td><td>Yes, as a jspdf optional dependency, at the same version as with 3.0.4</td><td>Says nothing: no <code>peerDependencies</code>; jspdf's range for it, <code>^1.0.0-rc.5</code>, is unchanged</td><td>Yes: the <code>.html()</code> PDFs and a screenshot passed to <code>addImage</code> are byte-identical to 3.0.4 and match Chromium's own rendering</td><td>None needed</td></tr>
+<tr><td>canvg 3.0.11 · 8.8M</td><td>Yes, as a jspdf optional dependency, at the same version as with 3.0.4</td><td>Says nothing: no <code>peerDependencies</code>. jspdf 4.2.1 still asks for <code>^3.0.11</code>, so canvg 4.0.3 is never used</td><td>No, and the same on 3.0.4 (byte-identical): <code>doc.addSvgAsImage(svg, 10, 10, 120, 60)</code> in the default mm document embeds a 400×200 SVG as a 120×60-pixel JPEG (25 ppi) of its top-left corner. In a px-unit document sized to the SVG, the shapes render but the <code>&lt;text></code> is missing</td><td>None found; not caused by the upgrade</td></tr>
+<tr><td>svg2pdf.js 2.8.1 · 242K</td><td>Yes, no warnings</td><td>Yes: <code>peerDependencies</code> <code>jspdf: "^4.0.0 || ^3.0.0 || ^2.0.0"</code>, but only from 2.7.0. Versions 2.4.0 to 2.6.0 make <code>npm ci</code> fail (<a href="#npm-ci-eresolve-old-addons">npm-ci-eresolve-old-addons</a>)</td><td>Mostly: byte-identical to 3.0.4, the shapes match Chromium and the text is extractable, but <code>font-family="Helvetica"</code> text is set in Times-Roman, the same on 3.0.4</td><td>Use 2.7.0 or later. No workaround was tested for the font</td></tr>
+</tbody>
+</table>
+<p>Optional dependencies did not move: after an in-place upgrade (with a lockfile) and after fresh installs (without one), both jspdf versions resolve html2canvas 1.4.1, canvg 3.0.11, dompurify 3.4.17, core-js 3.51.0, fflate 0.8.3, fast-png 6.4.0 and @babel/runtime 7.29.10. 4.2.1 only raises two minimum versions, dompurify <code>^3.2.4</code> to <code>^3.3.1</code> and @babel/runtime <code>^7.28.4</code> to <code>^7.28.6</code>, which the installed versions already meet.</p>
+</section>
+<section id="versions">
+<h2>Versions tested</h2>
+<table>
+<thead><tr><th>Package</th><th>Before</th><th>After</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>jspdf</td><td>3.0.4</td><td>4.2.1</td><td>latest 3.x (published 2025-11-19) and latest 4.x (published 2026-03-17)</td></tr>
+<tr><td>jspdf-autotable</td><td>5.0.9</td><td>5.0.9</td><td>latest; 5.0.2 and 4.0.0 also tested for <a href="#npm-ci-eresolve-old-addons">npm-ci-eresolve-old-addons</a></td></tr>
+<tr><td>svg2pdf.js</td><td>2.8.1</td><td>2.8.1</td><td>latest; 2.6.0 also tested</td></tr>
+<tr><td>html2canvas / canvg / dompurify</td><td>1.4.1 / 3.0.11 / 3.4.17</td><td>1.4.1 / 3.0.11 / 3.4.17</td><td>jspdf optional dependencies</td></tr>
+<tr><td>core-js / fflate / fast-png / @babel/runtime</td><td>3.51.0 / 0.8.3 / 6.4.0 / 7.29.10</td><td>3.51.0 / 0.8.3 / 6.4.0 / 7.29.10</td><td></td></tr>
+<tr><td>typescript (test tool only)</td><td>6.0.2</td><td>6.0.2</td><td></td></tr>
+<tr><td>playwright-core / Chromium (test tools only)</td><td>1.56.1 / 141.0.7390.37</td><td>1.56.1 / 141.0.7390.37</td><td>headless</td></tr>
+</tbody>
+</table>
+<p>Runtime: Linux, Node v22.22.0, npm 10.9.4, run on 22 October 2026 (UTC). PDFs were inspected with poppler-utils 24.02.0, pypdf 6.17.0, Pillow 12.3.0, numpy 2.5.3 and ImageMagick 6.9.12-98.</p>
+<p>Version proof: every run first asked the installed package for its version and stopped unless <code>jsPDF.version</code> in Node matched the version under test and the browser bundle's <code>window.jspdf.jsPDF.version</code> matched Node's. Two runs on 3.0.4 gave identical files once the creation date and file ID were removed, so the differences found come from the version change.</p>
+<p>Effort: about 49 minutes of wall clock (about 30 working), about 46 shell commands, a 175-line baseline app, a PDF comparison script and 9 small probe scripts. The baseline app alone found only the file-path problems. The <code>addMetadata</code> and AcroForm findings came from probes chosen from a diff of the two versions' built code, and the <code>npm ci</code> failure from installing older add-on versions.</p>
+</section>
+<section id="not-verified">
+<h2>Not verified</h2>
+<p>Everything ran on one machine, with one Node version, one package manager, one browser engine and one PDF renderer.</p>
+<ul>
+<li><strong>Viewers:</strong> rendering was checked only with poppler. Adobe Acrobat and Reader, Chrome's PDF viewer, Firefox's pdf.js, macOS Preview and mobile viewers were not tested, and each substitutes fonts (<a href="#add-font-file-path-not-embedded">add-font-file-path-not-embedded</a>) and draws form appearances (<a href="#acroform-names-with-spaces">acroform-names-with-spaces</a>) its own way.</li>
+<li><strong>Browsers:</strong> only headless Chromium 141. Firefox, Safari/WebKit and mobile browsers were not tested, and html2canvas output depends on the engine.</li>
+<li><strong>Module systems:</strong> only Node CommonJS <code>require</code> and the browser UMD bundle. Not run: the ES build (<code>jspdf.es.min.js</code>) that webpack, Vite, Rollup and esbuild use, Node ESM <code>import</code>, SSR frameworks, Deno, Bun, Electron and web workers. The ES build's code was not diffed either.</li>
+<li><strong>Node versions:</strong> only Node 22. The file-read block checks <code>process.permission</code>, which is experimental on Node 20 and absent on Node 18, so its behaviour there is unknown.</li>
+<li><strong>Operating systems:</strong> Linux only. Windows paths in <code>allowFsRead</code> (backslashes, drive letters, case-insensitive matching) were not tested, and the macOS <code>/tmp</code> to <code>/private/tmp</code> case is inferred from the Linux symlink test.</li>
+<li><strong>Package managers:</strong> only npm 10.9.4. How pnpm and yarn handle the add-on peer mismatch was not tested, and <code>npm ls</code> exiting 0 despite the mismatch was seen on npm 10 only.</li>
+<li><strong>TypeScript:</strong> only TypeScript 6.0.2 with <code>--strict</code> and <code>--skipLibCheck</code>.</li>
+<li><strong>Features never triggered:</strong> encryption and passwords; FreeText annotations; images larger than 512 MB; <code>output('pdfobjectnewwindow')</code> and <code>output('pdfjsnewwindow')</code>; asynchronous <code>loadFile(url, false, cb)</code> and <code>loadImageFile</code>; outlines and bookmarks, right-to-left text, <code>setLanguage</code>, and <code>.html()</code> with <code>fontFaces</code> or remote (CORS) images; GIF, BMP and WebP images; AcroForm text fields and list boxes; CJK, Arabic and emoji fonts; <code>output('blob')</code> and <code>output('bloburl')</code> in Node.</li>
+<li><strong>Seen in the 4.x code but never triggered</strong> (documented, not observed, so not listed as findings): the PNG, GIF and BMP decoders now throw <code>Image dimensions exceed 512MB, which is too large.</code> for very large images. A FreeText annotation's <code>/DS</code> string now goes through the encryptor, which matters only with encryption on. <code>output('pdfobjectnewwindow')</code> and <code>output('pdfjsnewwindow')</code> were rewritten to use DOM calls; the filename is now URI-encoded, and <code>&amp;</code> is used when <code>pdfJsUrl</code> already contains <code>?</code>. The package <code>exports</code> map gained a <code>"default"</code> condition, so resolvers that match neither <code>node</code> nor <code>browser</code> now get the ES build instead of failing. <code>loadImageFile</code> is an alias of <code>loadFile</code>, so it hits the same file-read block.</li>
+<li><strong>PDF/A</strong> was checked only by counting <code>pdfaid</code> elements in the XMP; no veraPDF validation.</li>
+<li><strong>The security advisory</strong> was only seen to clear in <code>npm audit</code>. No path-traversal inputs were tried, so whether 4.2.1 actually fixes it was not verified.</li>
+<li><strong>Old lockfiles:</strong> a lockfile with dompurify older than 3.3.1 would presumably be bumped by the upgrade. That is inferred from the range change, not reproduced.</li>
+<li><strong>Performance:</strong> no speed or memory comparison.</li>
+<li><strong>Other wrappers:</strong> jsPDF wrappers beyond the four companions, such as html2pdf.js, were not tested.</li>
+<li><strong>Download counts</strong> for the four companions are the figures given when the test was set up; they were not re-checked.</li>
+<li><strong>Method limits:</strong> comparisons ignored the creation date, file ID, <code>/Producer</code> and the cross-reference table. Renders were compared at 60 dpi with a per-channel threshold of 24, so smaller pixel differences in files that were not byte-identical would not be flagged. Probes were chosen from the baseline plus a diff of the Node and UMD builds, so changes elsewhere, or in code paths that were not probed, would be missed. Each <code>.html()</code> PDF has 1 poppler error on both versions; it was not investigated.</li>
+<li><strong>The evidence:</strong> the app, probe scripts, PDFs and comparison output existed only in the temporary workspace used for the run; nothing was committed to a shared repository.</li>
+</ul>
+</section>
+</main>
+<footer>
+<p>Report by @Arjun, 22 October 2026. JSON: <a href="/jspdf/3-to-4.json">/jspdf/3-to-4.json</a>. All reports: <a href="/">/</a>. Agent index: <a href="/llms.txt">/llms.txt</a>.</p>
+</footer>
+</body>
+</html>

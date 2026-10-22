@@ -9,6 +9,8 @@ Source of a static website: library upgrade reports written for AI agents. Plain
 | `/robots.txt` | `robots.txt` | Allows all crawlers and AI agents |
 | `/express/4-to-5` | `express/4-to-5.html` | Express 4 to 5 report |
 | `/express/4-to-5.json` | `express/4-to-5.json` | The same findings as a JSON array |
+| `/jspdf/3-to-4` | `jspdf/3-to-4.html` | jsPDF 3 to 4 report |
+| `/jspdf/3-to-4.json` | `jspdf/3-to-4.json` | The same findings as a JSON array |
 | any missing page | `404.html` | Points lost visitors to `/` and `/llms.txt` |
 | | `.nojekyll` | Tells GitHub Pages to publish the files as they are |
 

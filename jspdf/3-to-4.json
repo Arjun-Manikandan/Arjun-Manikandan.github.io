@@ -1,0 +1,134 @@
+[
+  {
+    "id": "add-font-file-path-not-embedded",
+    "title": "`addFont()` with a file path in Node saves the PDF without the font, and nothing is thrown",
+    "severity": "silent",
+    "error_message": "jsPDF PubSub Error Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.\njsPDF PubSub Error Cannot read properties of undefined (reading 'widths')",
+    "symptom": "On 4.2.1, in Node, `doc.addFont(path, …)` throws nothing. jsPDF logs two errors to `console.error` (their first lines are above), and `doc.save()` still writes the PDF, without the font: `pdffonts` lists it under its file path as a Type 1 font with `emb` `no`, viewers substitute another face (poppler drew a condensed one), `✓` drops out of the extracted text, and the file shrank from 287,901 to 149,987 bytes. On 3.0.4 the same call embedded the font. No exception reaches your code; the console is the only signal.",
+    "cause": "In Node, 4.2.1 refuses to read local files unless you opt in, so the font file is never read (the same block as `add-image-file-path-throws`). `addFont` reports the failure through jsPDF's internal PubSub, which logs it instead of throwing.",
+    "fix_before": "doc.addFont('assets/DejaVuSans-Bold.ttf', 'DejaVu', 'bold');",
+    "fix_after": "// works on 3.x and 4.x; the output is byte-identical to 3.0.4\ndoc.addFileToVFS('DejaVuSans-Bold.ttf', fs.readFileSync('assets/DejaVuSans-Bold.ttf').toString('base64'));\ndoc.addFont('DejaVuSans-Bold.ttf', 'DejaVu', 'bold');",
+    "evidence": "observed"
+  },
+  {
+    "id": "add-metadata-double-escaped",
+    "title": "`addMetadata()` now XML-escapes its input, so text escaped in advance, as the 3.x JSDoc asked, is escaped twice",
+    "severity": "silent",
+    "error_message": null,
+    "symptom": "On 4.2.1, `doc.addMetadata('Tom &amp; Jerry &lt;Q3&gt; report')` stores the XMP value `Tom &amp; Jerry &lt;Q3&gt; report`, with the entities as literal text. On 3.0.4 the value was `Tom & Jerry <Q3> report`. The pages render the same. No error.",
+    "cause": "4.x XML-escapes the string passed to `addMetadata()`; 3.x inserted it as it was, which is why its JSDoc asked for escaped input. Plain text gives valid XMP on 4.2.1 (the value reads `Tom & Jerry`), but on 3.0.4 the same plain string gives XMP that an XML parser rejects (`ExpatError: not well-formed (invalid token)`), so the change has to ship with the upgrade.",
+    "fix_before": "doc.addMetadata('Tom &amp; Jerry'); // escaped in advance, as the 3.x JSDoc asked",
+    "fix_after": "// 4.x only: change it in the upgrade commit (on 3.0.4 this string gives XMP that won't parse)\ndoc.addMetadata('Tom & Jerry');",
+    "evidence": "observed"
+  },
+  {
+    "id": "add-metadata-xmp-markup-becomes-text",
+    "title": "`addMetadata()` with XMP markup stores it as escaped text, so the PDF/A identification (`pdfaid:part`) disappears",
+    "severity": "silent",
+    "error_message": null,
+    "symptom": "On 4.2.1 the XMP holds 0 `pdfaid:part` elements instead of 1: the markup is stored as escaped text, so the file no longer identifies itself as PDF/A. No error.",
+    "cause": "4.x escapes everything passed to `addMetadata()` (`add-metadata-double-escaped`); markup goes through only in the new raw mode, `addMetadata(xmp, true)`, which takes a complete `x:xmpmeta` packet. Verified on 4.2.1: one `x:xmpmeta`, one `pdfaid:part`. On 3.0.4 the same call nests the packet inside jsPDF's own wrapper with `xmlns:jspdf=\"true\"` and gives 2 `x:xmpmeta` elements, so make this change in the upgrade commit, not before.",
+    "fix_before": "doc.addMetadata('<pdfaid:part xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">1</pdfaid:part>');",
+    "fix_after": "// 4.x only: pass a complete XMP packet and true, in the upgrade commit\ndoc.addMetadata('<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>1</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance></rdf:Description></rdf:RDF></x:xmpmeta>', true);",
+    "evidence": "observed"
+  },
+  {
+    "id": "acroform-names-with-spaces",
+    "title": "AcroForm names containing a space: the selected radio button renders differently, and the file is still malformed",
+    "severity": "silent",
+    "error_message": null,
+    "symptom": "With a radio-button group whose option and value names contain a space, the selected button shows a stray dark box on 4.2.1 and nothing on 3.0.4 (rendered with poppler). The file is malformed on both versions: poppler reports `Dictionary key must be a name object` errors, 68 on 3.0.4 and 36 on 4.2.1. jsPDF itself throws and logs nothing. Rare: only names with spaces are affected.",
+    "cause": "4.2.1 escapes the space in `/V` and `/AS` (`/V /Bank#20transfer`) but not in the appearance-dictionary (`/AP`) keys, which stay `/Bank transfer 12 0 R`, so the value no longer matches its appearance.",
+    "fix_before": "radio.createOption('Bank transfer');\nradio.value = 'Bank transfer';",
+    "fix_after": "// names without spaces: identical output on 3.x and 4.x, and 0 poppler errors\nradio.createOption('bank_transfer');\nradio.value = 'bank_transfer';",
+    "evidence": "observed"
+  },
+  {
+    "id": "add-image-file-path-throws",
+    "title": "`addImage()` with a file path throws in Node, and no PDF is produced",
+    "severity": "loud",
+    "error_message": "Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.",
+    "symptom": "On 4.2.1, in Node, `addImage` with a file path throws and the PDF is not produced. `doc.loadFile(path)` throws the same message. On 3.0.4 the Node build read the file itself. Neither remedy the message names works as written (`allow-fs-read-static-ignored`, `node-permission-flag-breaks-save`).",
+    "cause": "In Node, 4.2.1 refuses to read local files unless you opt in. Passing the bytes works on both versions. The 4.x-only opt-in covers `addImage` only when set on `jsPDF.API`, must name the real path when a symlink is involved, and needs a cast in TypeScript (`doc-allow-fs-read-skips-add-image`, `allow-fs-read-symlink-rejected`, `ts-allow-fs-read-not-typed`).",
+    "fix_before": "doc.addImage('assets/photo.jpg', 'JPEG', 55, 70, 100, 75);",
+    "fix_after": "// works on 3.x and 4.x; the output is byte-identical to 3.0.4\ndoc.addImage(fs.readFileSync('assets/photo.jpg'), 'JPEG', 55, 70, 100, 75);\n// 4.x-only alternative, set before the first new jsPDF():\n// jsPDF.API.allowFsRead = [fs.realpathSync('assets') + '/*'];",
+    "evidence": "observed"
+  },
+  {
+    "id": "npm-ci-eresolve-old-addons",
+    "title": "With jspdf-autotable older than 5.0.7 or svg2pdf.js older than 2.7.0, `npm install jspdf@4` passes but `npm ci` fails with `ERESOLVE`",
+    "severity": "loud",
+    "error_message": "npm error code ERESOLVE\nnpm error ERESOLVE could not resolve\nnpm error While resolving: jspdf-autotable@5.0.2\nnpm error Found: jspdf@4.2.1\nnpm error Could not resolve dependency:\nnpm error peer jspdf@\"^2 || ^3\" from jspdf-autotable@5.0.2",
+    "symptom": "In a project on jspdf 3.0.4 with jspdf-autotable 5.0.2 (also tested: 4.0.0) or svg2pdf.js 2.6.0, `npm install jspdf@4` exits 0, prints only `npm warn ERESOLVE overriding peer dependency` and leaves the old add-on in place; `npm ls` exits 0 too. The next `npm ci`, usually in CI, fails with exit code 1, in all 3 setups. At runtime the old add-ons work: their output is byte-identical on 3.0.4 and 4.2.1. With the fix, npm prints no warnings and `npm ci` exits 0.",
+    "cause": "jspdf-autotable declares jspdf 4 support (`^2 || ^3 || ^4`) only from 5.0.7, and svg2pdf.js (`^4.0.0 || ^3.0.0 || ^2.0.0`) only from 2.7.0, so jspdf-autotable 4.0.0–5.0.2 and svg2pdf.js 2.4.0–2.6.0 exclude jspdf 4. `npm install` overrides the conflict with a warning; `npm ci` refuses it.",
+    "fix_before": "npm install jspdf@4",
+    "fix_after": "npm install jspdf@4 jspdf-autotable@^5.0.7\n# with svg2pdf.js: npm install jspdf@4 svg2pdf.js@^2.7.0",
+    "evidence": "observed"
+  },
+  {
+    "id": "allow-fs-read-static-ignored",
+    "title": "Setting `jsPDF.allowFsRead`, as the error message says, has no effect",
+    "severity": "loud",
+    "error_message": "Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.",
+    "symptom": "On 4.2.1, after `jsPDF.allowFsRead = [dir + '/*']`, `addImage(path)` still throws the same message, and `addFont(path)` still logs `jsPDF PubSub Error` and leaves the font out.",
+    "cause": "The static property the message names is ignored. Set on the prototype, as `jsPDF.API.allowFsRead`, the same list made font, image and `loadFile` reads all work. `doc.allowFsRead` covers only some of them (`doc-allow-fs-read-skips-add-image`).",
+    "fix_before": "jsPDF.allowFsRead = [dir + '/*']; // what the error message names: ignored",
+    "fix_after": "jsPDF.API.allowFsRead = [fs.realpathSync(dir) + '/*']; // 4.x only, before the first new jsPDF()\n// better: pass the bytes (see add-image-file-path-throws)",
+    "evidence": "observed"
+  },
+  {
+    "id": "doc-allow-fs-read-skips-add-image",
+    "title": "`doc.allowFsRead`, the form in the JSDoc and the typings, fixes `addFont` but not `addImage`",
+    "severity": "loud",
+    "error_message": "Trying to read a file from local file system. To enable this feature either run node with the --permission and --allow-fs-read flags or set the jsPDF.allowFsRead property.",
+    "symptom": "On 4.2.1, with `doc.allowFsRead = [dir + '/*']`, `addFont(path)` and `loadFile(path)` work, but `addImage(path)` on the same document still throws the same message.",
+    "cause": "The per-document opt-in does not reach `addImage`. It is the form in jsPDF's own JSDoc example and the only one in its TypeScript types, so the form that does cover `addImage` fails to compile (`ts-allow-fs-read-not-typed`).",
+    "fix_before": "doc.allowFsRead = [dir + '/*']; // covers addFont and loadFile, not addImage",
+    "fix_after": "jsPDF.API.allowFsRead = [fs.realpathSync(dir) + '/*']; // 4.x only, before the first new jsPDF()\n// better: pass the bytes (see add-image-file-path-throws)",
+    "evidence": "observed"
+  },
+  {
+    "id": "allow-fs-read-symlink-rejected",
+    "title": "An `allowFsRead` entry that goes through a symlink is rejected with \"Permission denied\"",
+    "severity": "loud",
+    "error_message": "Cannot read file '/home/user/jspdf-upgrade/app/assets/photo.jpg'. Permission denied.",
+    "symptom": "On 4.2.1, when the allowlisted folder is reached through a symlink (as with a `current -> releases/N` deploy), `addImage` throws this message, and `addFont` logs it and leaves the font out. The path in the message is the file's real path, with the symlink resolved.",
+    "cause": "An allowlist entry written through the symlink does not match the resolved path; the same entry passed through `fs.realpathSync` does. Untested inference: on macOS, `/tmp` is a symlink to `/private/tmp`, so allowlisting a folder under `/tmp` would fail the same way.",
+    "fix_before": "jsPDF.API.allowFsRead = [LINK + '/*']; // LINK is a symlink to the assets folder, e.g. current -> releases/42",
+    "fix_after": "jsPDF.API.allowFsRead = [fs.realpathSync(LINK) + '/*'];",
+    "evidence": "observed"
+  },
+  {
+    "id": "node-permission-flag-breaks-save",
+    "title": "Running Node with `--permission --allow-fs-read`, the other remedy the error message names, makes `doc.save()` and Playwright throw",
+    "severity": "loud",
+    "error_message": "Access to this API has been restricted. Use --allow-fs-write to manage permissions.\nbrowserType.launch: Access to this API has been restricted. Use --allow-child-process to manage permissions.",
+    "symptom": "Under `node --permission --allow-fs-read=<dir>`, `doc.save()` throws the first message, and launching Chromium through Playwright fails with the second. With the extra flags the full test app passed. 3.0.4 behaves the same under `--permission`.",
+    "cause": "This is Node's permission model, not a jsPDF regression: under `--permission`, writing files and starting child processes need flags of their own. A project meets it only by following the 4.x error message.",
+    "fix_before": "node --permission --allow-fs-read=<dir> app.js",
+    "fix_after": "node --permission --allow-fs-read=<dir> --allow-fs-write=<dir> --allow-child-process app.js\n# better: don't turn on --permission just for jsPDF; pass the bytes instead (see add-image-file-path-throws)",
+    "evidence": "observed"
+  },
+  {
+    "id": "ts-allow-fs-read-not-typed",
+    "title": "TypeScript with jsPDF 4.2.1's own types: `jsPDF.API.allowFsRead`, the opt-in that works, fails to compile",
+    "severity": "loud",
+    "error_message": "error TS2339: Property 'allowFsRead' does not exist on type 'jsPDFAPI'.",
+    "symptom": "`tsc` 6.0.2 with `--strict` rejects the assignment, with both `bundler` and `nodenext` module resolution. With the cast it reports 0 errors.",
+    "cause": "jsPDF 4.2.1's types declare `allowFsRead` only on the document (`doc.allowFsRead`), which does not cover `addImage` (`doc-allow-fs-read-skips-add-image`).",
+    "fix_before": "jsPDF.API.allowFsRead = [fs.realpathSync(dir) + '/*'];",
+    "fix_after": "(jsPDF.API as any).allowFsRead = [fs.realpathSync(dir) + '/*'];",
+    "evidence": "observed"
+  },
+  {
+    "id": "add-js-parentheses-escaped",
+    "title": "`addJS()` and `autoPrint({ variant: 'javascript' })` now escape parentheses in the PDF's JavaScript",
+    "severity": "cosmetic",
+    "error_message": null,
+    "symptom": "On 4.2.1 the parentheses in the `/JS` string are escaped (`/JS (app.alert\\(\"Smile :\\)\"\\);)`), so the PDF bytes differ. Code with balanced parentheses, such as `app.alert(\"Hello (world)\");`, reads back the same on both versions. Code with an unbalanced one, such as `app.alert(\"Smile :)\");`, was cut short on 3.0.4 and is now stored whole. Nothing to fix; listed because the bytes changed.",
+    "cause": "4.x escapes `(` and `)` in the JavaScript string it writes. 3.x wrote them as they were, so an unbalanced `)` ended the PDF string early.",
+    "fix_before": "# JavaScript stored by doc.addJS('app.alert(\"Smile :)\");') on 3.0.4: cut short\napp.alert(\"Smile :)\"",
+    "fix_after": "# on 4.2.1: stored whole; no code change needed\napp.alert(\"Smile :)\");",
+    "evidence": "observed"
+  }
+]
